@@ -1,0 +1,50 @@
+import express, { Request, Response } from 'express';
+import http from 'http';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { Server } from 'socket.io';
+import { deviceManager } from './services/deviceManager.js';
+import { setupSocketHandlers } from './socket/socketHandler.js';
+import { ClientToServerEvents, ServerToClientEvents } from './types/index.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const PORT = process.env.PORT ? Number.parseInt(process.env.PORT, 10) : 3000;
+const clientDistPath = path.join(process.cwd(), 'client/dist');
+const frontendOrigin = process.env.CLIENT_ORIGIN || process.env.FRONTEND_ORIGIN || '*';
+const app = express();
+const startTime = Date.now();
+
+app.disable('x-powered-by');
+app.use(express.static(clientDistPath));
+
+app.get(['/health', '/healthz'], (_request: Request, response: Response) => {
+  response.json({
+    status: 'ok',
+    service: 'nearflux-signaling',
+    uptime: Math.floor((Date.now() - startTime) / 1000),
+    connectedDevices: deviceManager.getCount(),
+    fileDataRelay: false,
+    timestamp: new Date().toISOString(),
+  });
+});
+
+app.get('*', (_request: Request, response: Response) => {
+  const indexPath = path.join(clientDistPath, 'index.html');
+  if (fs.existsSync(indexPath)) return response.sendFile(indexPath);
+  response.status(200).send('NearFlux signaling server is online. Build the client to serve the web application.');
+});
+
+const server = http.createServer(app);
+const io = new Server<ClientToServerEvents, ServerToClientEvents>(server, {
+  cors: { origin: frontendOrigin, methods: ['GET', 'POST'] },
+});
+
+setupSocketHandlers(io);
+
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`NearFlux signaling server listening on port ${PORT}`);
+  console.log('Server responsibility: ephemeral rooms, presence, and WebRTC signaling only.');
+  console.log('File relay: disabled. TURN: not configured.');
+});

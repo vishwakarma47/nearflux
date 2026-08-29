@@ -1,0 +1,5 @@
+# Deep Signal verification
+
+The exposed preview was reloaded after the Deep Signal rewrite. It includes the slim icon rail, persistent room card, cyan signal visualization, device/activity workspace, and updated Send Files / Send Folder CTAs. The initial preview inherited a light-theme preference from the browser session; the theme initializer was updated so new sessions default to Deep Signal dark mode while explicit user preferences still win. The preview local storage was reset for the next verification pass.
+
+The latest prompt-aligned preview rendered in Deep Signal dark mode. The header device label is compact/truncated, the sidebar is icon-only with tooltips, the room code uses a consistent cyan monospace treatment, the transfer hero shows the centered cyan signal rings, the CTA pair has normalized sizing, and the persistent room copy control changes to a checkmark state with `Copied!` and a live confirmation message for 1.5 seconds. Connected devices remain visible with animated online indicators.

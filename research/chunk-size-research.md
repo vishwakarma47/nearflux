@@ -1,0 +1,5 @@
+# WebRTC chunk-size research
+
+MDN documents that `RTCSctpTransport.maxMessageSize` exposes the maximum message size accepted by `RTCDataChannel.send()`. MDN’s WebRTC DataChannel guide recommends keeping messages moderately small because large messages can cause head-of-line blocking, and notes that if the SDP does not advertise `max-message-size`, a 64 KB default is assumed. See https://developer.mozilla.org/en-US/docs/Web/API/RTCSctpTransport/maxMessageSize and https://developer.mozilla.org/en-US/docs/Web/API/WebRTC_API/Using_data_channels.
+
+For NearFlux, 5 MB is too aggressive for broad browser and network compatibility, especially because the current sender packages each application chunk as a single DataChannel message. 2 MB improves per-chunk overhead but increases the risk of peer/browser message-size rejection and retransmission cost. 1 MB is the most suitable of the requested options: it reduces control-message overhead compared with 128 KB while retaining a safer margin across modern browser implementations. The adaptive queue flow control remains necessary regardless of chunk size because it protects the browser’s send queue, not the transfer rate.

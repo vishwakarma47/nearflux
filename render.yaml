@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: nearflux
+    runtime: node
+    plan: free
+    buildCommand: npm ci && npm --prefix server ci && npm --prefix client ci && npm run build:server && npm run build:client
+    startCommand: node server/dist/server/src/index.js
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: CLIENT_ORIGIN
+        sync: false

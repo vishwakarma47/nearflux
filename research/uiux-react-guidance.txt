@@ -1,0 +1,46 @@
+## UI Pro Max Stack Guidelines
+**Stack:** react | **Query:** responsive accessible utility interface
+**Source:** stacks/react.csv | **Found:** 3 results
+
+### Result 1
+- **Category:** Props
+- **Guideline:** Validate props with TypeScript
+- **Description:** Use TypeScript interfaces for prop types
+- **Do:** interface Props { name: string }
+- **Don't:** PropTypes or no validation
+- **Code Good:** interface ButtonProps { onClick: () => void }
+- **Code Bad:** Button.propTypes = {}
+- **Severity:** Medium
+- **Docs URL:** 
+- **Applies To:** react 19.2.x
+- **Status:** active
+- **Verified At:** 2026-08-13
+
+### Result 2
+- **Category:** TypeScript
+- **Guideline:** Type component props
+- **Description:** Define interfaces for all props
+- **Do:** interface Props with all prop types
+- **Don't:** any or missing types
+- **Code Good:** interface Props { name: string }
+- **Code Bad:** function Component(props: any)
+- **Severity:** High
+- **Docs URL:** https://react.dev/learn/passing-props-to-a-component
+- **Applies To:** react 19.2.x
+- **Status:** active
+- **Verified At:** 2026-08-13
+
+### Result 3
+- **Category:** Testing
+- **Guideline:** Use testing-library queries
+- **Description:** Use accessible queries
+- **Do:** getByRole getByLabelText
+- **Don't:** getByTestId for everything
+- **Code Good:** getByRole('button')
+- **Code Bad:** getByTestId('submit-btn')
+- **Severity:** Medium
+- **Docs URL:** https://testing-library.com/docs/queries/about#priority
+- **Applies To:** react 19.2.x
+- **Status:** active
+- **Verified At:** 2026-08-13
+

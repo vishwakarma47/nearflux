@@ -1,0 +1,125 @@
+## UI Pro Max Search Results
+**Domain:** ux | **Query:** keyboard focus modal drag drop file transfer
+**Source:** ux-guidelines.csv | **Found:** 11 results
+
+### Result 1
+- **Category:** Interaction
+- **Issue:** Focus States
+- **Platform:** All
+- **Description:** Keyboard focus, including controls inside a modal, needs a visible indicator
+- **Do:** Use a visible focus ring on every interactive control, including modal controls
+- **Don't:** Remove focus outline without replacement
+- **Code Example Good:** focus:ring-2 focus:ring-blue-500
+- **Code Example Bad:** outline-none without alternative
+- **Severity:** High
+
+### Result 2
+- **Category:** Accessibility
+- **Issue:** Focus Not Obscured (Enhanced)
+- **Platform:** Web
+- **Description:** WCAG 2.2 AAA requires keyboard focus to remain fully visible
+- **Do:** Keep the entire focused component unobscured by author-created content
+- **Don't:** Present this enhanced AAA criterion as an AA requirement or allow persistent UI to hide any part of focus
+- **Code Example Good:** close persistent overlay before focus moves behind it
+- **Code Example Bad:** sticky footer covers half the focused button
+- **Severity:** Medium
+
+### Result 3
+- **Category:** Accessibility
+- **Issue:** Focus Not Obscured (Minimum)
+- **Platform:** Web
+- **Description:** WCAG 2.2 AA requires keyboard focus to remain at least partially visible
+- **Do:** Offset sticky UI with scroll-padding and dismiss or move persistent overlays
+- **Don't:** Let headers footers banners or chat widgets fully cover focus
+- **Code Example Good:** scroll-padding-top: var(--header-height)
+- **Code Example Bad:** fixed overlay covers :focus
+- **Severity:** High
+
+### Result 4
+- **Category:** Accessibility
+- **Issue:** Keyboard Navigation
+- **Platform:** Web
+- **Description:** Web users need complete keyboard navigation with visible focus on every operable control
+- **Do:** Keep tab order aligned with visual order and test every action without a pointer
+- **Don't:** Keyboard traps or illogical tab order
+- **Code Example Good:** tabIndex for custom order
+- **Code Example Bad:** Unreachable elements
+- **Severity:** High
+
+### Result 5
+- **Category:** Accessibility
+- **Issue:** Compact Control Semantics
+- **Platform:** Web
+- **Description:** Interactive chips need a native role accessible name state keyboard operation and visible focus
+- **Do:** Prefer a button and expose pressed or selected state that matches the visible label
+- **Don't:** Use a clickable div or reveal the only action on hover
+- **Code Example Good:** <button aria-pressed='true'>Open now</button>
+- **Code Example Bad:** <div class='selected' onclick='toggle()'>Open now</div>
+- **Severity:** Critical
+
+### Result 6
+- **Category:** Accessibility
+- **Issue:** Dragging Movements
+- **Platform:** All
+- **Description:** WCAG 2.2 AA requires a single-pointer alternative for author-controlled drag operations
+- **Do:** Add buttons menus or tap-to-move controls and retain keyboard operation
+- **Don't:** Make dragging the only way to reorder resize or select
+- **Code Example Good:** Move up and Move down buttons beside drag handle
+- **Code Example Bad:** drag handle only
+- **Severity:** High
+
+### Result 7
+- **Category:** Accessibility
+- **Issue:** Focus Appearance
+- **Platform:** Web
+- **Description:** WCAG 2.2 AAA defines minimum area and contrast for focus indicators
+- **Do:** Use an indicator at least as large as a 2 CSS px perimeter with 3:1 state contrast
+- **Don't:** Present this enhanced AAA criterion as an AA requirement or use a thin low-contrast outline
+- **Code Example Good:** outline: 2px solid currentColor; outline-offset: 2px
+- **Code Example Bad:** box-shadow: 0 0 1px low-contrast
+- **Severity:** Medium
+
+### Result 8
+- **Category:** Accessibility
+- **Issue:** Skip Links
+- **Platform:** Web
+- **Description:** Allow keyboard users to skip navigation
+- **Do:** Provide skip to main content link
+- **Don't:** No skip link on nav-heavy pages
+- **Code Example Good:** Skip to main content link
+- **Code Example Bad:** 100 tabs to reach content
+- **Severity:** Medium
+
+### Result 9
+- **Category:** Forms
+- **Issue:** Mobile Keyboards
+- **Platform:** Mobile
+- **Description:** Show appropriate keyboard for input type
+- **Do:** Use inputmode attribute
+- **Don't:** Default keyboard for all inputs
+- **Code Example Good:** inputmode='numeric'
+- **Code Example Bad:** Text keyboard for numbers
+- **Severity:** Medium
+
+### Result 10
+- **Category:** Accessibility
+- **Issue:** Contextual Live Badge Updates
+- **Platform:** Web
+- **Description:** Async badge and count changes should announce a meaningful contextual status without moving focus
+- **Do:** Use one appropriate atomic status message such as 3 items in cart
+- **Don't:** Announce a bare number or make every badge a competing live region
+- **Code Example Good:** <span role='status' aria-atomic='true'>3 items in cart</span>
+- **Code Example Bad:** <span aria-live='polite'>3</span>
+- **Severity:** High
+
+### Result 11
+- **Category:** Forms / Accessibility
+- **Issue:** Focusable Error Summary
+- **Platform:** Web
+- **Description:** An error summary for failed validation complements inline field errors and must be easy to find by keyboard and screen reader users
+- **Do:** Place it at the top of the form; move focus to its heading or container after failed submit; link each item to its invalid field; retain inline errors
+- **Don't:** Replace inline errors with a visual-only summary or move focus on every blur
+- **Code Example Good:** <div role="alert" tabindex="-1" aria-labelledby="error-title"><h2 id="error-title">There is a problem</h2><a href="#email">Enter an email address</a></div>
+- **Code Example Bad:** Toast only with no field links or focus target
+- **Severity:** High
+

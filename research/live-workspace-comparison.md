@@ -1,0 +1,9 @@
+# Live workspace comparison
+
+The hosted URL `https://naive-x0tz.onrender.com/?room=FLUX-9TPR` is functional and shows the current refreshed single-column layout. After dismissing onboarding, it presents a compact header, centered file dropzone, a full-width connected-devices card, and footer links. Its main weakness relative to the supplied modern reference is the missing desktop workspace structure: there is no persistent left navigation, no right-side room invite panel, no selected-files queue visible beside the devices, no active-transfer panel, and no transfer history surface.
+
+The second reference uses a dense but calm desktop workspace: top header across the viewport, left rail for Home/Transfers/Devices/Rooms/Settings, a large two-column content area with the transfer dropzone and room invite card, then three lower panels for connected devices, selected files, and active transfers. The redesign should preserve the current room and direct-P2P behavior while changing the composition to this workspace layout.
+
+The sandbox preview initially returned Vite's blocked-host response. Adding the sandbox proxy suffix to `server.allowedHosts` fixed the issue. The exposed preview now loads the modern workspace at `https://5173-ihg4dm5wydwcalhecn8rg-0c8f19a4.us4.manus.computer/?room=FLUX-9TPR`, with the onboarding modal, sidebar, large transfer hero, persistent room invite panel, device section, and active-transfer panel visible.
+
+The exposed public preview was tested interactively. Onboarding completed successfully, revealing the full workspace with left navigation, direct-transfer hero, persistent room card, connected-device section, and active-transfer panel. The room-share action opened the refreshed modal with QR code, room code, copy link, close-room, new-code, and join-by-code controls. The public preview now loads through the sandbox proxy and is suitable for interactive review.

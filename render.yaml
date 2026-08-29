@@ -3,7 +3,7 @@ services:
     name: nearflux
     runtime: node
     plan: free
-    buildCommand: npm ci && npm --prefix server ci && npm --prefix client ci && npm run build:server && npm run build:client
+    buildCommand: npm ci --include=dev && npm --prefix server ci --include=dev && npm --prefix client ci --include=dev && npm run build
     startCommand: node server/dist/server/src/index.js
     healthCheckPath: /health
     envVars:

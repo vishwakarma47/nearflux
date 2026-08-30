@@ -14,6 +14,8 @@ export function setupSocketHandlers(
   io: Server<ClientToServerEvents, ServerToClientEvents>
 ): void {
   io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>) => {
+    socket.on('keepalive', () => {});
+
     socket.on('join-room', (payload: JoinRoomPayload) => {
       const previousRoom = deviceManager.getRoomCode(socket.id);
       if (previousRoom) socket.leave(previousRoom);

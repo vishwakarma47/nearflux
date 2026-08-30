@@ -101,7 +101,12 @@ export function useSocket(deviceName: string) {
 
     if (socket.connected) handleConnect();
 
+    const keepAlive = window.setInterval(() => {
+      if (socket.connected) socket.emit('keepalive');
+    }, 25_000);
+
     return () => {
+      window.clearInterval(keepAlive);
       socket.off('connect', handleConnect);
       socket.off('disconnect', handleDisconnect);
       socket.off('room-state', handleRoomState);

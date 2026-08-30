@@ -83,6 +83,7 @@ export interface ServerToClientEvents {
 }
 
 export interface ClientToServerEvents {
+  keepalive: () => void;
   'join-room': (payload: JoinRoomPayload) => void;
   'leave-room': (payload: { roomCode: string }) => void;
   'close-room': (payload: { roomCode: string }) => void;

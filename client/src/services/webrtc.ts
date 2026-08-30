@@ -6,6 +6,8 @@ const DIRECT_CONNECTION_TIMEOUT = 12_000;
 const DATA_CHANNEL_HIGH_WATER_MARK = 4 * 1024 * 1024;
 const DATA_CHANNEL_LOW_WATER_MARK = 1 * 1024 * 1024;
 const QUEUE_WAIT_TIMEOUT = 30_000;
+const TRANSFER_STALL_TIMEOUT = 30_000;
+const TRANSFER_WATCHDOG_INTERVAL = 5_000;
 
 type DirectCandidateType = 'host' | 'srflx' | 'relay' | 'unknown';
 
@@ -77,6 +79,8 @@ export class WebRTCService {
   private remoteReady = false;
   private remoteReadyWaiters: Array<() => void> = [];
   private connectionTimeoutId: number | null = null;
+  private transferWatchdogId: number | null = null;
+  private lastTransferActivity = 0;
 
   constructor(localPeerId: string, remotePeerId: string, isInitiator: boolean, roomCode: string) {
     this.localPeerId = localPeerId;
@@ -273,6 +277,28 @@ export class WebRTCService {
     }
   }
 
+  private startTransferWatchdog(): void {
+    this.stopTransferWatchdog();
+    this.lastTransferActivity = Date.now();
+    this.transferWatchdogId = window.setInterval(() => {
+      if (Date.now() - this.lastTransferActivity <= TRANSFER_STALL_TIMEOUT) return;
+      this.stopTransferWatchdog();
+      this.failTransfer('Transfer stalled. The direct connection may have dropped.');
+    }, TRANSFER_WATCHDOG_INTERVAL);
+  }
+
+  private resetTransferWatchdog(): void {
+    if (this.transferWatchdogId !== null) this.lastTransferActivity = Date.now();
+  }
+
+  private stopTransferWatchdog(): void {
+    if (this.transferWatchdogId !== null) {
+      window.clearInterval(this.transferWatchdogId);
+      this.transferWatchdogId = null;
+    }
+    this.lastTransferActivity = 0;
+  }
+
   private setupDataChannel(channel: RTCDataChannel): void {
     channel.binaryType = 'arraybuffer';
     channel.bufferedAmountLowThreshold = DATA_CHANNEL_LOW_WATER_MARK;
@@ -296,6 +322,7 @@ export class WebRTCService {
     this.startTime = Date.now();
     this.lastSpeedCheckTime = Date.now();
     this.lastBytesCount = 0;
+    this.startTransferWatchdog();
 
     for (let fileIndex = 0; fileIndex < files.length; fileIndex += 1) {
       const { file, relativePath } = files[fileIndex];
@@ -340,6 +367,7 @@ export class WebRTCService {
       await this.sendData(JSON.stringify(endMessage));
     }
 
+    this.stopTransferWatchdog();
     this.onProgressCallback?.({ status: 'completed', progress: 100, timeRemaining: 0, connectionType: this.directCandidateType });
   }
 
@@ -349,6 +377,7 @@ export class WebRTCService {
       return;
     }
     if (!(data instanceof ArrayBuffer)) return;
+    this.resetTransferWatchdog();
     if (!this.directConnectionVerified) {
       this.failTransfer('File data arrived before direct P2P verification.');
       return;
@@ -370,6 +399,7 @@ export class WebRTCService {
   private handleControlMessage(data: string): void {
     try {
       const parsed = JSON.parse(data) as FileStartMessage | FileChunkMessage | FileEndMessage | DirectReadyMessage;
+      this.resetTransferWatchdog();
       if (parsed.type === 'DIRECT_READY') {
         this.remoteReady = true;
         this.remoteReadyWaiters.splice(0).forEach((resolve) => resolve());
@@ -384,6 +414,7 @@ export class WebRTCService {
         this.startTime = Date.now();
         this.lastSpeedCheckTime = Date.now();
         this.lastBytesCount = 0;
+        this.startTransferWatchdog();
         this.onProgressCallback?.({
           status: 'transferring',
           currentFileName: parsed.relativePath || parsed.fileName,
@@ -441,6 +472,7 @@ export class WebRTCService {
     try {
       if (typeof data === 'string') channel.send(data);
       else channel.send(data);
+      this.resetTransferWatchdog();
     } catch (error) {
       throw new Error(error instanceof Error ? error.message : 'The browser rejected the direct data channel payload.');
     }
@@ -495,6 +527,7 @@ export class WebRTCService {
 
   private failDirectConnection(message: string): void {
     if (this.directConnectionVerified) return;
+    this.stopTransferWatchdog();
     this.directConnectionVerified = false;
     this.onProgressCallback?.({
       status: 'failed',
@@ -506,11 +539,13 @@ export class WebRTCService {
   }
 
   private failTransfer(message: string): void {
+    this.stopTransferWatchdog();
     this.onProgressCallback?.({ status: 'failed', error: message, serverRole: 'signaling-only' });
     this.close();
   }
 
   public close(): void {
+    this.stopTransferWatchdog();
     if (this.connectionTimeoutId !== null) {
       window.clearTimeout(this.connectionTimeoutId);
       this.connectionTimeoutId = null;

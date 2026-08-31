@@ -10,7 +10,8 @@ import { socketService } from './socket.js';
  * timeout, no stall watchdog, no ready/ack/verification deadlines and no
  * send-queue deadline. A transfer only fails on an observable event:
  *
- *   - ICE / peer connection reports 'failed' or 'closed'
+ *   - ICE / peer connection reports 'failed' (after the ICE restart budget is
+ *     spent) or 'closed'
  *   - the data channel errors or closes
  *   - the selected ICE candidate pair is a relay pair
  *   - a protocol violation (bad order, size mismatch, checksum mismatch)
@@ -21,6 +22,16 @@ import { socketService } from './socket.js';
  * surfacing a state change (for example ICE 'disconnected' that never
  * recovers and never escalates to 'failed'), a pending operation waits
  * indefinitely instead of erroring out. That is the intended behaviour here.
+ *
+ * NO RELAY
+ * --------
+ * TURN is deliberately absent: STUN discovers addresses, and the selected
+ * candidate pair is inspected so a relay pair is rejected outright. When ICE
+ * fails there is therefore no fallback, only recovery, so 'failed' triggers an
+ * ICE restart (MAX_ICE_RESTART_ATTEMPTS, counted in attempts and never in
+ * seconds) before the transfer is given up. If it is still impossible, the
+ * gathered candidate types are used to explain WHY (STUN unreachable vs.
+ * symmetric NAT) instead of reporting a bare "ICE connection failed".
  */
 
 const CHUNK_SIZE = 512 * 1024;
@@ -50,6 +61,15 @@ const CANDIDATE_POLL_INTERVAL = 200;
 
 const FNV_OFFSET_BASIS = 0x811c9dc5;
 const FNV_PRIME = 0x01000193;
+
+/**
+ * ICE restart budget. Bounded by ATTEMPTS, not by time: every retry is
+ * triggered by an observable ICE 'failed' event, never by a clock. A restart
+ * re-gathers candidates and forces new NAT bindings, which is the only
+ * recovery available when relay/TURN is disabled.
+ */
+const MAX_ICE_RESTART_ATTEMPTS = 2;
+
 
 type DirectCandidateType =
   | 'host'
@@ -81,6 +101,21 @@ type CandidatePairLike = {
 
 type CandidateLike = {
   candidateType?: string;
+};
+
+/**
+ * What ICE actually managed to gather on each side. With relay disabled this is
+ * the only way to explain a failure: no reflexive candidate means STUN itself
+ * was unreachable, while reflexive candidates on both sides that still fail to
+ * pair means at least one NAT is symmetric and no direct path exists.
+ */
+export type IceDiagnostics = {
+  localTypes: string[];
+  remoteTypes: string[];
+  localReflexive: boolean;
+  remoteReflexive: boolean;
+  gatheringState: RTCIceGatheringState | 'unknown';
+  restartAttempts: number;
 };
 
 type FileStartMessage = {
@@ -204,6 +239,16 @@ export class WebRTCService {
 
   private pendingCandidates: RTCIceCandidateInit[] = [];
 
+  /** Candidate types seen locally and from the peer, for failure diagnosis. */
+  private localCandidateTypes = new Set<string>();
+  private remoteCandidateTypes = new Set<string>();
+
+  private iceRestartAttempts = 0;
+  private iceRestartInFlight = false;
+
+  /** Cached so diagnostics survive the teardown that follows a failure. */
+  private lastGatheringState: RTCIceGatheringState | 'unknown' = 'unknown';
+
   private currentFile: ReceiveFile | null = null;
 
   private startTime = 0;
@@ -276,10 +321,21 @@ export class WebRTCService {
 
   public initialize(): RTCPeerConnection {
     const config: RTCConfiguration = {
+      /**
+       * Several independent STUN providers. If one is blocked or rate-limited
+       * the others can still produce a reflexive candidate, and reaching these
+       * over IPv6 often yields a direct path even when IPv4 is behind CGNAT.
+       */
       iceServers: [
-        { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:stun1.l.google.com:19302' },
-        { urls: 'stun:stun2.l.google.com:19302' },
+        {
+          urls: [
+            'stun:stun.l.google.com:19302',
+            'stun:stun1.l.google.com:19302',
+            'stun:stun2.l.google.com:19302',
+          ],
+        },
+        { urls: 'stun:stun.cloudflare.com:3478' },
+        { urls: 'stun:stun.nextcloud.com:443' },
       ],
 
       /**
@@ -287,12 +343,19 @@ export class WebRTCService {
        * inspected and relay usage is rejected.
        */
       iceTransportPolicy: 'all',
+
+      /** Pre-gather so candidates exist the moment the offer is created. */
+      iceCandidatePoolSize: 4,
     };
 
     this.peerConnection = new RTCPeerConnection(config);
 
     this.peerConnection.onicecandidate = (event) => {
       if (!event.candidate) return;
+
+      if (event.candidate.type) {
+        this.localCandidateTypes.add(event.candidate.type);
+      }
 
       /**
        * A discovered relay candidate does NOT mean the connection will use
@@ -314,21 +377,36 @@ export class WebRTCService {
        * failure; it either recovers or escalates to 'failed'.
        */
       if (state === 'failed') {
-        this.failConnection(
-          'ICE connection failed. A direct P2P connection could not be established.'
-        );
+        /** Retry by re-gathering before giving up. Never a timed retry. */
+        void this.recoverFromIceFailure();
       } else if (state === 'closed') {
         this.failConnection('The ICE connection was closed.');
+      } else if (state === 'connected' || state === 'completed') {
+        /** A working path resets the budget for any later NAT rebinding. */
+        this.iceRestartAttempts = 0;
       }
     };
 
     this.peerConnection.onconnectionstatechange = () => {
       const state = this.peerConnection?.connectionState;
 
+      /**
+       * connectionState goes 'failed' as soon as the ICE transport fails, so it
+       * must funnel into the same recovery path. Failing here directly would
+       * pre-empt the ICE restart, because fail() is sticky.
+       */
       if (state === 'failed') {
-        this.failConnection('The WebRTC connection failed.');
+        void this.recoverFromIceFailure();
       } else if (state === 'closed') {
         this.failConnection('The WebRTC connection was closed unexpectedly.');
+      }
+    };
+
+    this.peerConnection.onicegatheringstatechange = () => {
+      const state = this.peerConnection?.iceGatheringState;
+
+      if (state) {
+        this.lastGatheringState = state;
       }
     };
 
@@ -403,6 +481,8 @@ export class WebRTCService {
   public async addIceCandidate(candidate: RTCIceCandidateInit): Promise<void> {
     if (!this.peerConnection) return;
 
+    this.noteRemoteCandidateType(candidate);
+
     if (!this.peerConnection.remoteDescription) {
       this.pendingCandidates.push(candidate);
       return;
@@ -429,6 +509,166 @@ export class WebRTCService {
     for (const candidate of queued) {
       await this.addIceCandidate(candidate);
     }
+  }
+
+  /** Records the peer's candidate types straight out of the SDP attribute. */
+  private noteRemoteCandidateType(candidate: RTCIceCandidateInit): void {
+    const line = candidate.candidate;
+
+    if (!line) return;
+
+    const match = /(?:^|\s)typ\s+(host|srflx|prflx|relay)(?:\s|$)/.exec(line);
+
+    if (match?.[1]) {
+      this.remoteCandidateTypes.add(match[1]);
+    }
+  }
+
+  private hasReflexive(types: Set<string>): boolean {
+    return types.has('srflx') || types.has('prflx');
+  }
+
+  /** Everything ICE learned, for the UI and for support/debugging. */
+  public getIceDiagnostics(): IceDiagnostics {
+    return {
+      localTypes: [...this.localCandidateTypes],
+      remoteTypes: [...this.remoteCandidateTypes],
+      localReflexive: this.hasReflexive(this.localCandidateTypes),
+      remoteReflexive: this.hasReflexive(this.remoteCandidateTypes),
+      gatheringState:
+        this.peerConnection?.iceGatheringState ?? this.lastGatheringState,
+      restartAttempts: this.iceRestartAttempts,
+    };
+  }
+
+  /**
+   * Turns a bare 'ICE failed' into something the person in front of the screen
+   * can act on. Relay is disabled by design, so the message has to explain the
+   * cause instead of offering a fallback.
+   */
+  private describeIceFailure(): string {
+    const localReflexive = this.hasReflexive(this.localCandidateTypes);
+    const remoteReflexive = this.hasReflexive(this.remoteCandidateTypes);
+
+    if (!localReflexive && !remoteReflexive) {
+      return (
+        'No direct P2P route could be found: neither device could reach a STUN ' +
+        'server, so only local network addresses were available. A firewall, ' +
+        'VPN or blocked UDP traffic is the usual cause. Put both devices on the ' +
+        'same network, or disable the VPN, and try again.'
+      );
+    }
+
+    if (!localReflexive) {
+      return (
+        'No direct P2P route could be found: this device could not reach a STUN ' +
+        'server, so it never learned its public address. Check for a VPN, proxy ' +
+        'or firewall that blocks UDP, then try again.'
+      );
+    }
+
+    if (!remoteReflexive) {
+      return (
+        'No direct P2P route could be found: the other device could not reach a ' +
+        'STUN server, so it never learned its public address. It is likely ' +
+        'behind a VPN or a firewall that blocks UDP.'
+      );
+    }
+
+    return (
+      'No direct P2P route could be found: both devices know their public ' +
+      'addresses but their networks refuse to connect them directly, which ' +
+      'happens with strict (symmetric) NAT such as many mobile and corporate ' +
+      'networks. Relay is disabled, so try the same Wi-Fi network or a phone ' +
+      'hotspot.'
+    );
+  }
+
+  /**
+   * ICE reported 'failed'. Re-gather instead of giving up: a restart forces new
+   * NAT bindings and a fresh candidate exchange, which is the only recovery
+   * available with relay disabled. Bounded by attempts, never by a timer, and
+   * every attempt is triggered by an observable state change.
+   */
+  private async recoverFromIceFailure(): Promise<void> {
+    if (this.isClosed || this.hasFailed || this.iceRestartInFlight) {
+      return;
+    }
+
+    const pc = this.peerConnection;
+
+    if (!pc) return;
+
+    this.iceRestartInFlight = true;
+
+    /**
+     * One ICE failure is reported twice, once on oniceconnectionstatechange and
+     * once on onconnectionstatechange, both inside the same task. Yielding here
+     * keeps iceRestartInFlight raised across both, so a single failure consumes
+     * exactly one attempt. A genuinely new 'failed' (after the restart went
+     * back to checking) arrives in a later task and counts again.
+     */
+    await Promise.resolve();
+
+    if (this.isClosed || this.hasFailed) {
+      this.iceRestartInFlight = false;
+      return;
+    }
+
+    if (this.iceRestartAttempts >= MAX_ICE_RESTART_ATTEMPTS) {
+      this.iceRestartInFlight = false;
+      this.failConnection(this.describeIceFailure());
+      return;
+    }
+
+
+    this.iceRestartAttempts += 1;
+    this.iceRestartInFlight = true;
+
+    /** Keep the UI in 'connecting', not stuck at a dead 0%. */
+    this.onProgressCallback?.({
+      status: 'checking_direct_connection',
+      connectionType: 'unknown',
+      serverRole: 'signaling-only',
+    });
+
+    try {
+      if (this.isInitiator) {
+        /**
+         * Only the offerer renegotiates. The answerer re-gathers automatically
+         * when this offer arrives, so there is no glare.
+         */
+        const offer = await pc.createOffer({ iceRestart: true });
+
+        await pc.setLocalDescription(offer);
+
+        socketService.sendWebRTCOffer({
+          roomCode: this.roomCode,
+          senderId: this.localPeerId,
+          targetId: this.remotePeerId,
+          signal: offer,
+        });
+      } else {
+        /** Marks the transport so the peer's restart offer re-gathers here. */
+        pc.restartIce();
+      }
+    } catch {
+      this.failConnection(this.describeIceFailure());
+    } finally {
+      this.iceRestartInFlight = false;
+    }
+  }
+
+  /**
+   * Manual retry hook for a "try again" button. Same event-driven restart, with
+   * the budget reset because the person explicitly asked for another attempt.
+   */
+  public async retryDirectConnection(): Promise<void> {
+    if (this.isClosed || this.hasFailed) return;
+
+    this.iceRestartAttempts = 0;
+
+    await this.recoverFromIceFailure();
   }
 
   /**
@@ -472,19 +712,20 @@ export class WebRTCService {
 
     /** Runs until verified or until the connection reports a failure. */
     for (;;) {
-      if (this.isClosed || !this.peerConnection) {
+      if (this.isClosed || this.hasFailed || !this.peerConnection) {
         throw new Error('WebRTC connection was closed.');
       }
 
       const connectionState = this.peerConnection.connectionState;
       const iceState = this.peerConnection.iceConnectionState;
 
-      if (
-        connectionState === 'failed' ||
-        connectionState === 'closed' ||
-        iceState === 'failed' ||
-        iceState === 'closed'
-      ) {
+      /**
+       * 'failed' is NOT terminal any more: an ICE restart re-gathers and the
+       * pair can still come up. fail() is the single authority on giving up
+       * (checked above via hasFailed), so this loop only aborts on a closed
+       * connection and keeps polling through a restart.
+       */
+      if (connectionState === 'closed' || iceState === 'closed') {
         throw new Error('The direct WebRTC connection failed.');
       }
 

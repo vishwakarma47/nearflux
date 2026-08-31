@@ -1,4 +1,6 @@
 import { useState } from 'react';
+import { WifiOff, LoaderCircle, RefreshCw } from 'lucide-react';
+import { useApp } from './context/AppContext';
 import { AppProvider } from './context/AppContext';
 import { Header } from './components/Header';
 import { Sidebar, WorkspaceView } from './components/Sidebar';
@@ -34,6 +36,7 @@ const viewCopy: Record<WorkspaceView, { kicker: string; title: string; descripti
 const ViewHeader: React.FC<{ view: WorkspaceView }> = ({ view }) => <div className="view-header"><div><span className="section-kicker">{viewCopy[view].kicker}</span><h2>{viewCopy[view].title}</h2><p>{viewCopy[view].description}</p></div></div>;
 
 const MainContent: React.FC = () => {
+  const { serverState } = useApp();
   const [infoKey, setInfoKey] = useState<string | null>(null);
   const [activeView, setActiveView] = useState<WorkspaceView>('home');
   const [isWorkspaceRoomOpen, setIsWorkspaceRoomOpen] = useState(false);
@@ -45,6 +48,8 @@ const MainContent: React.FC = () => {
   const roomOpen = () => setIsWorkspaceRoomOpen(true);
 
   return <div className="app-container workspace-shell"><a className="skip-link" href="#main-content">Skip to main content</a><Header /><div className="workspace-layout"><Sidebar activeView={activeView} onNavigate={navigate} /><main id="main-content" className="main-content workspace-main" tabIndex={-1}>
+    {serverState === 'slow' && <div className="server-state-banner server-state-slow" role="status" aria-live="polite"><LoaderCircle size={16} className="spin" aria-hidden="true" /><span><strong>Waking server up...</strong><small>Render may take around 30 seconds on a cold start.</small></span></div>}
+    {serverState === 'offline' && <div className="server-state-banner server-state-offline" role="alert"><WifiOff size={16} aria-hidden="true" /><span><strong>Server unreachable</strong><small>Tap retry to reconnect to your private room.</small></span><button className="btn compact-btn" type="button" onClick={() => window.location.reload()}><RefreshCw size={14} aria-hidden="true" /> Retry</button></div>}
     {activeView === 'home' && <><div className="workspace-hero-grid"><FileDropzone /><RoomInvitePanel onOpenShare={roomOpen} /></div><div className="workspace-lower-grid"><DeviceList /><FileList /><TransferWorkspacePanel /></div></>}
     {activeView === 'transfers' && <div className="view-shell"><ViewHeader view="transfers" /><div className="view-two-column"><TransferHistoryPanel /><TransferWorkspacePanel /></div></div>}
     {activeView === 'devices' && <div className="view-shell"><ViewHeader view="devices" /><DeviceList /></div>}

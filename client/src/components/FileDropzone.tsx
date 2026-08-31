@@ -49,10 +49,12 @@ export const FileDropzone: React.FC = () => {
     >
       <input ref={fileInputRef} type="file" multiple hidden onChange={handleFileChange} />
       <input ref={folderInputRef} type="file" multiple hidden onChange={handleFileChange} {...({ webkitdirectory: '', directory: '' } as unknown as React.InputHTMLAttributes<HTMLInputElement>)} />
-      <div className="dropzone-orbit" aria-hidden="true"><span className="signal-ring ring-one" /><span className="signal-ring ring-two" /><span className="signal-ring ring-three" /><div className="dropzone-icon-wrapper">{isDragOver ? <FileUp size={34} strokeWidth={1.8} /> : <Upload size={34} strokeWidth={1.8} />}</div><ArrowRight size={20} className="dropzone-arrow" /><div className="dropzone-device-dot" /></div>
-      <div className="dropzone-copy"><span className="section-kicker">DIRECT TRANSFER</span><h2>{isDragOver ? 'Drop to transmit' : 'Send files directly'}</h2><p>{isDragOver ? 'Release to start a direct transfer.' : isCoarsePointer ? 'Tap to select files from this device.' : 'Drop files or folders here. Your files travel directly between devices.'}</p></div>
-      <div className="dropzone-actions"><button className="btn primary" type="button" onClick={() => fileInputRef.current?.click()}><Upload size={15} aria-hidden="true" /> Send Files</button><button className="btn secondary" type="button" onClick={() => folderInputRef.current?.click()}><FolderOpen size={15} aria-hidden="true" /> Send Folder</button></div>
-      <div className="dropzone-trust"><ShieldCheck size={14} aria-hidden="true" /><span>Direct P2P · Files never pass through the server</span></div>
+      <div className="transfer-panel-inner">
+        <div className="transfer-animation-zone" aria-hidden="true"><span className="signal-ring ring-one" /><span className="signal-ring ring-two" /><span className="signal-ring ring-three" /><div className="dropzone-icon-wrapper">{isDragOver ? <FileUp size={34} strokeWidth={1.8} /> : <Upload size={34} strokeWidth={1.8} />}</div><ArrowRight size={20} className="dropzone-arrow" /><div className="dropzone-device-dot" /></div>
+        <div className="transfer-text"><span className="section-kicker">DIRECT TRANSFER</span><h2>{isDragOver ? 'Drop to transmit' : 'Send files directly'}</h2><p>{isDragOver ? 'Release to start a direct transfer.' : isCoarsePointer ? 'Tap to select files from this device.' : 'Drop files or folders here. Your files travel directly between devices.'}</p></div>
+        <div className="dropzone-actions transfer-buttons"><button className="btn primary btn-send-files" type="button" onClick={() => fileInputRef.current?.click()}><Upload size={15} aria-hidden="true" /> Send Files</button><button className="btn secondary btn-send-folder" type="button" onClick={() => folderInputRef.current?.click()}><FolderOpen size={15} aria-hidden="true" /> Send Folder</button></div>
+        <div className="dropzone-trust"><ShieldCheck size={14} aria-hidden="true" /><span>Direct P2P · Files never pass through the server</span></div>
+      </div>
     </section>
   );
 };

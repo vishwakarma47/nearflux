@@ -9,6 +9,7 @@ export function useSocket(deviceName: string) {
   const urlRoomCode = getRoomCodeFromUrl();
   const hasInvalidRoomParam = Boolean(rawRoomCode && !isValidRoomCode(normalizeRoomCode(rawRoomCode)));
   const [isConnected, setIsConnected] = useState(false);
+  const [serverState, setServerState] = useState<'connecting' | 'slow' | 'online' | 'offline'>('connecting');
   const [currentDevice, setCurrentDevice] = useState<Device | null>(null);
   const [nearbyDevices, setNearbyDevices] = useState<Device[]>([]);
   const [roomCode, setRoomCode] = useState(() => urlRoomCode || (rawRoomCode ? '' : generateRoomCode()));
@@ -34,12 +35,19 @@ export function useSocket(deviceName: string) {
   useEffect(() => {
     const socket = socketService.connect();
 
+    const slowTimer = window.setTimeout(() => setServerState((state) => state === 'connecting' ? 'slow' : state), 4_000);
+    const failTimer = window.setTimeout(() => setServerState((state) => state === 'online' ? state : 'offline'), 45_000);
+
     const handleConnect = () => {
+      window.clearTimeout(slowTimer);
+      window.clearTimeout(failTimer);
+      setServerState('online');
       setIsConnected(true);
       if (roomCodeRef.current) emitJoin(roomCodeRef.current);
     };
 
     const handleDisconnect = () => {
+      setServerState('connecting');
       setIsConnected(false);
       setNearbyDevices([]);
     };
@@ -107,6 +115,8 @@ export function useSocket(deviceName: string) {
 
     return () => {
       window.clearInterval(keepAlive);
+      window.clearTimeout(slowTimer);
+      window.clearTimeout(failTimer);
       socket.off('connect', handleConnect);
       socket.off('disconnect', handleDisconnect);
       socket.off('room-state', handleRoomState);
@@ -158,6 +168,7 @@ export function useSocket(deviceName: string) {
 
   return {
     isConnected,
+    serverState,
     currentDevice,
     nearbyDevices,
     roomCode,

@@ -20,6 +20,7 @@ interface AppContextType {
   deviceName: string;
   updateDeviceName: (name: string) => void;
   isConnected: boolean;
+  serverState: 'connecting' | 'slow' | 'online' | 'offline';
   currentDevice: Device | null;
   nearbyDevices: Device[];
   roomCode: string;
@@ -65,6 +66,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const socketState = useSocket(deviceName);
   const {
     isConnected,
+    serverState,
     currentDevice,
     nearbyDevices,
     roomCode,
@@ -334,6 +336,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       deviceName,
       updateDeviceName: handleUpdateDeviceName,
       isConnected,
+      serverState,
       currentDevice,
       nearbyDevices,
       roomCode,

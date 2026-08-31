@@ -430,12 +430,16 @@ button { touch-action: manipulation; }
 /* Workspace stability, translucency, and view surfaces */
 html { color-scheme: dark; overflow-x: clip; }
 html[data-theme='light'] { color-scheme: light; }
-html.theme-transitioning,
-html.theme-transitioning body,
-html.theme-transitioning #root,
-html.theme-transitioning * {
-  transition: background-color 320ms ease, color 320ms ease, border-color 320ms ease, box-shadow 320ms ease, fill 320ms ease, stroke 320ms ease !important;
+body,
+.workspace-card, .section-card, .panel, .app-header, .workspace-sidebar,
+.btn, .badge, .device-badge, .guest-mode-pill, .connection-pill,
+.device-card, .room-invite-panel, .room-panel, .dropzone, .mobile-bottom-nav {
+  transition: background-color 250ms ease, color 250ms ease, border-color 250ms ease, box-shadow 250ms ease;
 }
+svg, svg path { transition: fill 200ms ease, stroke 200ms ease; }
+.theme-toggle-icon { display: inline-flex; transition: transform 350ms cubic-bezier(.34, 1.56, .64, 1), opacity 200ms ease; }
+.theme-toggle-icon.switching { transform: rotate(180deg) scale(.5); opacity: 0; }
+html.theme-transitioning body { opacity: .86; transition: opacity 150ms ease; }
 body, #root { width: 100%; max-width: 100%; overflow-x: clip; }
 .app-container.workspace-shell { width: min(calc(100% - 48px), 1480px); max-width: 100%; }
 .app-header, .header-actions, .workspace-layout, .workspace-main, .workspace-card, .section-card, .panel-heading, .panel-title, .panel-title > div, .view-shell, .view-two-column, .rooms-view-grid, .settings-grid { min-width: 0; }
@@ -451,6 +455,10 @@ body, #root { width: 100%; max-width: 100%; overflow-x: clip; }
 .workspace-lower-grid > * { height: 100%; }
 .dropzone { min-width: 0; grid-template-columns: minmax(0, 1fr) minmax(175px, .78fr); background: rgba(15, 24, 36, .70); backdrop-filter: blur(18px) saturate(125%); -webkit-backdrop-filter: blur(18px) saturate(125%); }
 [data-theme='light'] .dropzone { background: rgba(255, 255, 255, .72); }
+[data-theme='dark'] .btn-send-files { color: #fff; background: linear-gradient(135deg, #1d4ed8, #00c2ff); }
+[data-theme='dark'] .btn-send-files:hover:not(:disabled) { color: #fff; background: linear-gradient(135deg, #2563eb, #22d3ee); }
+[data-theme='light'] .btn-send-files { color: #fff; background: #2563eb; }
+[data-theme='light'] .btn-send-files:hover:not(:disabled) { color: #fff; background: #1d4ed8; }
 .dropzone-copy, .dropzone-copy > *, .dropzone-trust, .dropzone-actions { min-width: 0; max-width: 100%; }
 .dropzone h2, .dropzone p, .workspace-card h2, .workspace-card h3, .section-card h2, .section-card p, .view-header h2, .view-header p { max-width: 100%; overflow-wrap: anywhere; }
 .dropzone p, .view-header p, .settings-copy, .room-guide-card p, .history-empty span { overflow-wrap: anywhere; }
@@ -570,9 +578,9 @@ h1, h2, h3, .logo-text { font-family: var(--font-display); }
 
 @keyframes pulse-ring {
   0% { transform: translate(-50%, -50%) scale(.8); opacity: .8; }
-  100% { transform: translate(-50%, -50%) scale(2.2); opacity: 0; }
+  100% { transform: translate(-50%, -50%) scale(2.5); opacity: 0; }
 }
-.signal-ring { animation-name: pulse-ring; animation-duration: 2s; border-color: color-mix(in srgb, var(--accent) 42%, transparent); }
+.signal-ring { width: 120px; height: 120px; will-change: transform, opacity; animation-name: pulse-ring; animation-duration: 2s; border-color: color-mix(in srgb, var(--accent) 42%, transparent); }
 .signal-ring.ring-two { animation-delay: .6s; }
 .signal-ring.ring-three { animation-delay: 1.2s; }
 .dropzone.drag-over .signal-ring { animation-duration: .8s; }
@@ -596,6 +604,28 @@ h1, h2, h3, .logo-text { font-family: var(--font-display); }
 
 @media (max-width: 768px) {
   html, body, #root { min-width: 0; overflow-x: hidden; }
+  .header-logo-section { padding: 0; gap: 8px; }
+  .header-logo-icon { width: 36px; height: 36px; }
+  .header-logo-title { font-size: 18px; }
+  .header-logo-subtitle, .header-guest-pill, .header-help-btn { display: none !important; }
+  .header-pills-row { padding: 4px 0 8px; gap: 6px; }
+  .header-room-badge { max-width: none; overflow: visible; white-space: nowrap; }
+  .header-room-badge > span { overflow: visible; }
+  .header-room-prefix { display: none; }
+  .connection-pill { max-width: 40px; overflow: hidden; padding-right: 9px; padding-left: 9px; }
+  .connection-pill > span:last-child { display: none; }
+  .dropzone { display: flex !important; flex-direction: column; width: 100%; min-height: 0; padding: 0; text-align: center; }
+  .transfer-panel-inner { width: 100%; display: flex; flex-direction: column; align-items: center; text-align: center; gap: 16px; padding: 24px 20px; }
+  .transfer-animation-zone { position: relative; width: 140px; height: 140px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+  .dropzone-orbit { display: contents; }
+  .transfer-text { display: flex; flex-direction: column; align-items: center; gap: 6px; }
+  .transfer-text p { max-width: 30rem; }
+  .transfer-buttons { width: 100%; flex-direction: column; gap: 10px; }
+  .btn-send-files, .btn-send-folder { width: 100%; justify-content: center; }
+  .transfer-panel-inner .dropzone-trust { align-self: center; }
+  .signal-ring:nth-child(3) { display: none; }
+  .signal-ring { animation-duration: 2.5s; }
+
   .app-container.workspace-shell { width: 100%; max-width: 100%; margin: 0; padding: 10px 12px 76px; }
   .app-header { width: 100%; flex-wrap: nowrap !important; align-items: center; gap: 6px; padding: 8px 10px !important; }
   .header-actions { min-width: 0; width: auto; flex: 1 1 auto; justify-content: flex-end; gap: 5px; overflow: hidden; }
@@ -636,6 +666,8 @@ h1, h2, h3, .logo-text { font-family: var(--font-display); }
 
 @media (max-width: 380px) {
   .app-container.workspace-shell { padding-right: 8px; padding-left: 8px; }
+  .header-room-badge { max-width: 108px; }
+
   .app-header { padding-right: 6px !important; padding-left: 6px !important; }
   .guest-mode-pill { max-width: 54px; }
   .device-badge.room-pill { max-width: 94px; }
@@ -644,5 +676,38 @@ h1, h2, h3, .logo-text { font-family: var(--font-display); }
 }
 
 @media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { transition: none !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; }
   .mobile-bottom-nav-item { transition: none; }
 }
+
+
+/* Mobile refinement: connection wake-up feedback */
+.server-state-banner { width: 100%; min-height: 52px; display: flex; align-items: center; gap: 10px; padding: 10px 12px; border: 1px solid var(--border-strong); border-radius: 12px; color: var(--text-primary); background: var(--accent-light); }
+.server-state-banner > span { min-width: 0; display: grid; gap: 2px; }
+.server-state-banner strong { font-size: 11px; }
+.server-state-banner small { color: var(--text-secondary); font-size: 10px; line-height: 1.4; }
+.server-state-slow { color: var(--accent-color); }
+.server-state-offline { color: var(--danger-color); border-color: color-mix(in srgb, var(--danger-color) 35%, transparent); background: var(--danger-light); }
+.server-state-offline .btn { margin-left: auto; flex: 0 0 auto; color: var(--text-primary); background: var(--bg-card-soft); border: 1px solid var(--border-color); }
+.spin { animation: spin 1.1s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+@media (max-width: 768px) {
+  .server-state-banner { align-items: flex-start; }
+  .server-state-offline .btn { min-height: 40px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spin { animation: none; }
+}
+
+
+/* Refined transfer hero: one centered flow on every viewport */
+.dropzone { display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 348px; padding: 24px 20px; text-align: center; }
+.transfer-panel-inner { width: 100%; display: flex; flex-direction: column; align-items: center; text-align: center; gap: 16px; }
+.transfer-animation-zone { position: relative; width: 140px; height: 140px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+.dropzone-orbit { display: contents; }
+.transfer-text { display: flex; flex-direction: column; align-items: center; gap: 6px; }
+.transfer-text p { max-width: 430px; }
+.transfer-buttons { justify-content: center; }
+.transfer-panel-inner .dropzone-trust { align-self: center; }

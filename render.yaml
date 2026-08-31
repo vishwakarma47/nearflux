@@ -11,3 +11,5 @@ services:
         value: production
       - key: CLIENT_ORIGIN
         sync: false
+      - key: RENDER_EXTERNAL_URL
+        value: https://nearflux-p2p-share.onrender.com

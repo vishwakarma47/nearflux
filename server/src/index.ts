@@ -47,4 +47,17 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`NearFlux signaling server listening on port ${PORT}`);
   console.log('Server responsibility: ephemeral rooms, presence, and WebRTC signaling only.');
   console.log('File relay: disabled. TURN: not configured.');
+
+  const selfUrl = process.env.RENDER_EXTERNAL_URL || process.env.CLIENT_ORIGIN;
+  if (selfUrl) {
+    const selfPing = () => {
+      fetch(`${selfUrl.replace(/\/$/, '')}/health`)
+        .then((response) => response.json() as Promise<{ status?: string }>)
+        .then((payload) => console.log(`[keepalive] ${payload.status || 'ok'}`))
+        .catch((error: Error) => console.warn(`[keepalive] failed: ${error.message}`));
+    };
+    setTimeout(selfPing, 30_000);
+    setInterval(selfPing, 10 * 60 * 1000);
+    console.log('[keepalive] self-ping scheduled every 10 minutes.');
+  }
 });

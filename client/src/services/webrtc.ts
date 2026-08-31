@@ -1,29 +1,82 @@
-import { TransferState } from '../types/index.js';
+import type { TransferState } from '../types/index.js';
 import { socketService } from './socket.js';
 
-const CHUNK_SIZE = 512 * 1024;
+/**
+ * Strict direct-P2P transfer service.
+ *
+ * TIMEOUT POLICY
+ * --------------
+ * There are no time-based failures anywhere in this file: no connection
+ * timeout, no stall watchdog, no ready/ack/verification deadlines and no
+ * send-queue deadline. A transfer only fails on an observable event:
+ *
+ *   - ICE / peer connection reports 'failed' or 'closed'
+ *   - the data channel errors or closes
+ *   - the selected ICE candidate pair is a relay pair
+ *   - a protocol violation (bad order, size mismatch, checksum mismatch)
+ *   - the peer sends FILE_ERROR
+ *   - close() is called locally
+ *
+ * Consequence to be aware of: if the network goes quiet without the browser
+ * surfacing a state change (for example ICE 'disconnected' that never
+ * recovers and never escalates to 'failed'), a pending operation waits
+ * indefinitely instead of erroring out. That is the intended behaviour here.
+ */
 
-const DIRECT_CONNECTION_TIMEOUT = 15_000;
+const CHUNK_SIZE = 512 * 1024;
 
 const DATA_CHANNEL_HIGH_WATER_MARK = 4 * 1024 * 1024;
 const DATA_CHANNEL_LOW_WATER_MARK = 1 * 1024 * 1024;
 
-const QUEUE_WAIT_TIMEOUT = 30_000;
-const TRANSFER_STALL_TIMEOUT = 60_000;
-const TRANSFER_WATCHDOG_INTERVAL = 5_000;
+/**
+ * Chunks may stay unacknowledged while the sender keeps going. This keeps
+ * throughput independent of round-trip time while still bounding memory and
+ * guaranteeing the receiver stays in step with the sender.
+ */
+const MAX_UNACKED_CHUNKS = 16;
 
-const DIRECT_READY_TIMEOUT = 8_000;
-const FILE_VERIFICATION_TIMEOUT = 30_000;
-const CHUNK_ACK_TIMEOUT = 30_000;
+/**
+ * Wake-up interval only. Not a failure deadline: 'bufferedamountlow' is not
+ * fired by every browser in every state, so buffer space is re-checked
+ * periodically. Nothing fails when it elapses.
+ */
+const BUFFER_WAKEUP_INTERVAL = 100;
 
-type DirectCandidateType = 'host' | 'srflx' | 'relay' | 'unknown';
+/**
+ * Poll interval for ICE candidate-pair inspection. Also not a deadline: the
+ * loop runs until the pair is known or the connection reports failure.
+ */
+const CANDIDATE_POLL_INTERVAL = 200;
+
+const FNV_OFFSET_BASIS = 0x811c9dc5;
+const FNV_PRIME = 0x01000193;
+
+type DirectCandidateType =
+  | 'host'
+  | 'srflx'
+  | 'prflx'
+  | 'relay'
+  | 'unknown';
+
+/** Candidate types that count as a direct path. */
+type DirectConnectionType = 'host' | 'srflx' | 'prflx';
+
+/** Narrower shape reported to the UI layer via TransferState. */
+type ReportedConnectionType = 'host' | 'srflx' | 'relay' | 'unknown';
+
+type StatsLike = {
+  id: string;
+  type: string;
+  [key: string]: unknown;
+};
 
 type CandidatePairLike = {
+  id: string;
   state?: string;
   nominated?: boolean;
   selected?: boolean;
-  localCandidateId: string;
-  remoteCandidateId: string;
+  localCandidateId?: string;
+  remoteCandidateId?: string;
 };
 
 type CandidateLike = {
@@ -54,17 +107,19 @@ type FileEndMessage = {
   checksum: string;
 };
 
-type DirectReadyMessage = {
-  type: 'DIRECT_READY';
-};
-
-type DirectReadyAckMessage = {
-  type: 'DIRECT_READY_ACK';
-};
-
-type DirectVerifiedMessage = {
-  type: 'DIRECT_VERIFIED';
-};
+/**
+ * Readiness handshake, symmetric and role-free:
+ *
+ *   each peer -> DIRECT_READY once its OWN candidate pair is confirmed direct
+ *   each peer -> DIRECT_READY_ACK as a liveness echo (carries no readiness)
+ *
+ * A peer is considered ready only when its own DIRECT_READY arrives, which it
+ * only sends after confirming its own path. Neither side has a role-specific
+ * step, so the two sides cannot end up waiting on each other, and data never
+ * starts flowing towards a peer that has not confirmed its path yet.
+ */
+type DirectReadyMessage = { type: 'DIRECT_READY' };
+type DirectReadyAckMessage = { type: 'DIRECT_READY_ACK' };
 
 type FileChunkAckMessage = {
   type: 'FILE_CHUNK_ACK';
@@ -90,28 +145,24 @@ type ControlMessage =
   | FileEndMessage
   | DirectReadyMessage
   | DirectReadyAckMessage
-  | DirectVerifiedMessage
   | FileChunkAckMessage
   | FileVerifiedMessage
   | FileErrorMessage;
 
-type PendingChunkAck = {
-  fileId: string;
-  chunkIndex: number;
+type Deferred = {
+  promise: Promise<void>;
   resolve: () => void;
   reject: (error: Error) => void;
-  timeoutId: number;
 };
 
-type PendingFileVerification = {
+type PendingFileVerification = Deferred & {
   fileId: string;
-  resolve: () => void;
-  reject: (error: Error) => void;
-  timeoutId: number;
+  expectedChecksum: string;
 };
 
 type ReceiveFile = FileStartMessage & {
-  receivedChunks: Map<number, ArrayBuffer>;
+  /** Ordered chunk list. Order is enforced by chunkIndex validation. */
+  chunks: ArrayBuffer[];
   receivedBytes: number;
   checksum: number;
   expectedChunkIndex: number;
@@ -120,6 +171,25 @@ type ReceiveFile = FileStartMessage & {
 
 export interface TransferProgressCallback {
   (state: Partial<TransferState>): void;
+}
+
+function createDeferred(): Deferred {
+  let resolve!: () => void;
+  let reject!: (error: Error) => void;
+
+  const promise = new Promise<void>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+
+  /**
+   * Mark the promise as handled. rejectPendingOperations() may reject entries
+   * nobody is currently awaiting; without this, that surfaces as an unhandled
+   * rejection. Awaiting the same promise elsewhere still throws.
+   */
+  void promise.catch(() => undefined);
+
+  return { promise, resolve, reject };
 }
 
 export class WebRTCService {
@@ -139,6 +209,7 @@ export class WebRTCService {
   private startTime = 0;
   private lastBytesCount = 0;
   private lastSpeedCheckTime = 0;
+  private lastSpeed = 0;
 
   private onProgressCallback: TransferProgressCallback | null = null;
   private onChannelOpenCallback: (() => void) | null = null;
@@ -146,42 +217,30 @@ export class WebRTCService {
   private channelOpened = false;
 
   /**
-   * True only after:
-   *
-   * Sender -> DIRECT_READY
-   * Receiver -> DIRECT_READY_ACK
-   * Sender -> DIRECT_VERIFIED
+   * True only after the local candidate pair was inspected and found direct AND
+   * the peer sent its own DIRECT_READY. An open DataChannel alone is not enough.
+   * Required before sending file data.
    */
   private directConnectionVerified = false;
 
+  /** Our own candidate pair was inspected and is direct. */
+  private localDirectConfirmed = false;
+
   private directCandidateType: DirectCandidateType = 'unknown';
 
+  private verificationPromise: Promise<{ type: DirectConnectionType }> | null =
+    null;
+
+  private localReadySent = false;
   private remoteReady = false;
+  private remoteReadyWaiters: Deferred[] = [];
 
-  private remoteReadyWaiters: Array<{
-    resolve: () => void;
-    reject: (error: Error) => void;
-  }> = [];
-
-  private connectionTimeoutId: number | null = null;
-
-  private transferWatchdogId: number | null = null;
-
-  private lastTransferActivity = 0;
-
-  private pendingChunkAcks = new Map<string, PendingChunkAck>();
-
+  private pendingChunkAcks = new Map<string, Deferred>();
   private pendingFileVerification: PendingFileVerification | null = null;
 
-  private pendingDirectVerification: {
-    resolve: () => void;
-    reject: (error: Error) => void;
-    timeoutId: number;
-  } | null = null;
-
-  private receivedDirectReady = false;
-
-  private intentionallyClosing = false;
+  /** Sticky: once closed, this instance never reports failures again. */
+  private isClosed = false;
+  private hasFailed = false;
 
   constructor(
     localPeerId: string,
@@ -211,6 +270,10 @@ export class WebRTCService {
     return this.channelOpened;
   }
 
+  public isDirectConnectionVerified(): boolean {
+    return this.directConnectionVerified;
+  }
+
   public initialize(): RTCPeerConnection {
     const config: RTCConfiguration = {
       iceServers: [
@@ -220,8 +283,8 @@ export class WebRTCService {
       ],
 
       /**
-       * Relay candidates may be discovered, but we verify
-       * the selected candidate pair and reject relay usage.
+       * Relay candidates may be discovered, but the selected candidate pair is
+       * inspected and relay usage is rejected.
        */
       iceTransportPolicy: 'all',
     };
@@ -232,14 +295,8 @@ export class WebRTCService {
       if (!event.candidate) return;
 
       /**
-       * IMPORTANT:
-       *
-       * Do NOT reject relay candidates here.
-       *
-       * A relay candidate being discovered does NOT mean
-       * that the actual connection is using TURN.
-       *
-       * We check the selected candidate pair later.
+       * A discovered relay candidate does NOT mean the connection will use
+       * TURN, so candidates are never filtered here.
        */
       socketService.sendIceCandidate({
         roomCode: this.roomCode,
@@ -252,14 +309,16 @@ export class WebRTCService {
     this.peerConnection.oniceconnectionstatechange = () => {
       const state = this.peerConnection?.iceConnectionState;
 
+      /**
+       * 'disconnected' is transient and is deliberately not treated as a
+       * failure; it either recovers or escalates to 'failed'.
+       */
       if (state === 'failed') {
         this.failConnection(
           'ICE connection failed. A direct P2P connection could not be established.'
         );
       } else if (state === 'closed') {
-        this.failConnection(
-          'The ICE connection was closed.'
-        );
+        this.failConnection('The ICE connection was closed.');
       }
     };
 
@@ -267,31 +326,16 @@ export class WebRTCService {
       const state = this.peerConnection?.connectionState;
 
       if (state === 'failed') {
-        this.failConnection(
-          'The WebRTC connection failed.'
-        );
-      } else if (state === 'closed' && !this.intentionallyClosing) {
-        this.failConnection(
-          'The WebRTC connection was closed unexpectedly.'
-        );
+        this.failConnection('The WebRTC connection failed.');
+      } else if (state === 'closed') {
+        this.failConnection('The WebRTC connection was closed unexpectedly.');
       }
     };
 
-    this.connectionTimeoutId = window.setTimeout(() => {
-      if (!this.directConnectionVerified) {
-        this.failConnection(
-          'Direct P2P connection timed out. No relay or server-upload fallback is configured.'
-        );
-      }
-    }, DIRECT_CONNECTION_TIMEOUT);
-
     if (this.isInitiator) {
-      this.dataChannel = this.peerConnection.createDataChannel(
-        'fileTransfer',
-        {
-          ordered: true,
-        }
-      );
+      this.dataChannel = this.peerConnection.createDataChannel('fileTransfer', {
+        ordered: true,
+      });
 
       this.setupDataChannel(this.dataChannel);
     } else {
@@ -321,9 +365,7 @@ export class WebRTCService {
     });
   }
 
-  public async handleOffer(
-    offer: RTCSessionDescriptionInit
-  ): Promise<void> {
+  public async handleOffer(offer: RTCSessionDescriptionInit): Promise<void> {
     if (!this.peerConnection) {
       throw new Error('WebRTC connection is not initialized.');
     }
@@ -346,9 +388,7 @@ export class WebRTCService {
     });
   }
 
-  public async handleAnswer(
-    answer: RTCSessionDescriptionInit
-  ): Promise<void> {
+  public async handleAnswer(answer: RTCSessionDescriptionInit): Promise<void> {
     if (!this.peerConnection) {
       throw new Error('WebRTC connection is not initialized.');
     }
@@ -360,9 +400,7 @@ export class WebRTCService {
     await this.processPendingCandidates();
   }
 
-  public async addIceCandidate(
-    candidate: RTCIceCandidateInit
-  ): Promise<void> {
+  public async addIceCandidate(candidate: RTCIceCandidateInit): Promise<void> {
     if (!this.peerConnection) return;
 
     if (!this.peerConnection.remoteDescription) {
@@ -371,37 +409,60 @@ export class WebRTCService {
     }
 
     try {
-      await this.peerConnection.addIceCandidate(
-        new RTCIceCandidate(candidate)
-      );
+      await this.peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
     } catch {
-      this.failConnection(
-        'Unable to add the received ICE candidate.'
-      );
+      /**
+       * A single rejected candidate is normal (stale, unsupported transport,
+       * already-closed transport) and must NOT tear the session down. ICE
+       * reports 'failed' if no candidate pair can be formed at all.
+       */
+    }
+  }
+
+  private async processPendingCandidates(): Promise<void> {
+    if (!this.peerConnection || !this.peerConnection.remoteDescription) {
+      return;
+    }
+
+    const queued = this.pendingCandidates.splice(0);
+
+    for (const candidate of queued) {
+      await this.addIceCandidate(candidate);
     }
   }
 
   /**
-   * Performs actual direct connection verification.
+   * Verifies a real direct connection: the selected ICE candidate pair must be
+   * host/srflx/prflx (never relay) and the peer must confirm readiness on that
+   * same channel.
    *
-   * We do NOT consider the connection verified merely because
-   * the DataChannel is open.
-   *
-   * We also verify the selected ICE candidate pair.
+   * Runs until it succeeds or the connection reports a failure. The legacy
+   * timeout argument is accepted and ignored so existing call sites keep
+   * compiling.
    */
   public async verifyDirectConnection(
-    timeoutMs = DIRECT_CONNECTION_TIMEOUT
-  ): Promise<{ type: 'host' | 'srflx' }> {
+    _legacyTimeoutMs?: number
+  ): Promise<{ type: DirectConnectionType }> {
     if (this.directConnectionVerified) {
-      return {
-        type: this.directCandidateType as 'host' | 'srflx',
-      };
+      return { type: this.assertDirectType(this.directCandidateType) };
     }
 
-    if (!this.peerConnection || !this.dataChannel) {
-      throw new Error(
-        'WebRTC connection is not initialized.'
-      );
+    if (!this.verificationPromise) {
+      this.verificationPromise = this.runDirectVerification();
+
+      void this.verificationPromise.catch(() => undefined).finally(() => {
+        this.verificationPromise = null;
+      });
+    }
+
+    return this.verificationPromise;
+  }
+
+  private async runDirectVerification(): Promise<{
+    type: DirectConnectionType;
+  }> {
+    if (!this.peerConnection) {
+      throw new Error('WebRTC connection is not initialized.');
     }
 
     this.onProgressCallback?.({
@@ -409,18 +470,14 @@ export class WebRTCService {
       serverRole: 'signaling-only',
     });
 
-    const deadline = Date.now() + timeoutMs;
-
-    while (Date.now() < deadline) {
-      if (!this.peerConnection || !this.dataChannel) {
+    /** Runs until verified or until the connection reports a failure. */
+    for (;;) {
+      if (this.isClosed || !this.peerConnection) {
         throw new Error('WebRTC connection was closed.');
       }
 
-      const connectionState =
-        this.peerConnection.connectionState;
-
-      const iceState =
-        this.peerConnection.iceConnectionState;
+      const connectionState = this.peerConnection.connectionState;
+      const iceState = this.peerConnection.iceConnectionState;
 
       if (
         connectionState === 'failed' ||
@@ -428,140 +485,114 @@ export class WebRTCService {
         iceState === 'failed' ||
         iceState === 'closed'
       ) {
-        throw new Error(
-          'The direct WebRTC connection failed.'
-        );
+        throw new Error('The direct WebRTC connection failed.');
       }
 
-      const selected =
-        await this.getSelectedCandidateType();
+      if (this.dataChannel && this.dataChannel.readyState === 'open') {
+        const selected = await this.getSelectedCandidateType();
 
-      if (selected === 'relay') {
-        this.failConnection(
-          'A relay candidate pair was selected. Strict direct P2P transfer is disabled.'
-        );
+        if (selected === 'relay') {
+          this.failConnection(
+            'A relay candidate pair was selected. Strict direct P2P transfer is disabled.'
+          );
 
-        throw new Error('Relay connection rejected.');
-      }
-
-      if (
-        (selected === 'host' || selected === 'srflx') &&
-        this.dataChannel.readyState === 'open'
-      ) {
-        this.directCandidateType = selected;
-
-        await this.performDirectHandshake();
-
-        this.directConnectionVerified = true;
-
-        if (this.connectionTimeoutId !== null) {
-          window.clearTimeout(this.connectionTimeoutId);
-          this.connectionTimeoutId = null;
+          throw new Error('Relay connection rejected.');
         }
 
-        this.onProgressCallback?.({
-          status: 'ready_for_transfer',
-          connectionType: selected,
-          serverRole: 'signaling-only',
-        });
-
-        return {
-          type: selected,
-        };
+        if (selected !== 'unknown') {
+          return { type: await this.confirmDirectConnection(selected) };
+        }
       }
 
-      await wait(150);
+      await wait(CANDIDATE_POLL_INTERVAL);
     }
-
-    this.failConnection(
-      'Direct P2P connection failed. No relay or server-upload fallback is configured.'
-    );
-
-    throw new Error(
-      'Direct P2P connection unavailable.'
-    );
   }
 
   /**
-   * Direct handshake:
-   *
-   * Sender -> DIRECT_READY
-   * Receiver -> DIRECT_READY_ACK
-   * Sender -> DIRECT_VERIFIED
+   * Announces our own confirmed direct path and waits for the peer to announce
+   * its own. Both steps are identical on both peers, so no role can stall the
+   * other and the previous initiator/receiver-specific handshake (which could
+   * deadlock when the sender was not the initiator) is gone.
    */
-  private async performDirectHandshake(): Promise<void> {
-    if (!this.dataChannel) {
-      throw new Error('DataChannel is not available.');
-    }
+  private async confirmDirectConnection(
+    selected: DirectConnectionType
+  ): Promise<DirectConnectionType> {
+    this.directCandidateType = selected;
 
     /**
-     * Receiver waits for DIRECT_READY.
-     *
-     * Initiator sends it.
+     * Our own path is confirmed direct here. Inbound data is accepted from this
+     * point, before the peer handshake finishes, so a peer that starts sending
+     * as soon as it sees our DIRECT_READY can never race ahead of this flag.
      */
-    if (this.isInitiator) {
+    this.localDirectConfirmed = true;
+
+    await this.sendReadySignal();
+    await this.waitForRemoteReady();
+
+    this.directConnectionVerified = true;
+
+    this.onProgressCallback?.({
+      status: 'ready_for_transfer',
+      connectionType: this.reportedConnectionType(),
+      serverRole: 'signaling-only',
+    });
+
+    return selected;
+  }
+
+  private async sendReadySignal(): Promise<void> {
+    if (this.localReadySent) return;
+
+    this.localReadySent = true;
+
+    try {
       await this.sendData(
-        JSON.stringify({
-          type: 'DIRECT_READY',
-        } satisfies DirectReadyMessage)
+        JSON.stringify({ type: 'DIRECT_READY' } satisfies DirectReadyMessage)
       );
-
-      await new Promise<void>((resolve, reject) => {
-        const timeoutId = window.setTimeout(() => {
-          this.pendingDirectVerification = null;
-
-          reject(
-            new Error(
-              'The recipient did not acknowledge the direct P2P connection.'
-            )
-          );
-        }, DIRECT_READY_TIMEOUT);
-
-        this.pendingDirectVerification = {
-          resolve,
-          reject,
-          timeoutId,
-        };
-      });
-
-      await this.sendData(
-        JSON.stringify({
-          type: 'DIRECT_VERIFIED',
-        } satisfies DirectVerifiedMessage)
-      );
-    } else {
-      /**
-       * Receiver doesn't initiate the handshake.
-       *
-       * It waits for DIRECT_READY and responds from
-       * handleControlMessage().
-       */
-      await new Promise<void>((resolve, reject) => {
-        const deadline = window.setTimeout(() => {
-          const index = this.remoteReadyWaiters.findIndex(
-            (item) => item.resolve === resolve
-          );
-
-          if (index >= 0) {
-            this.remoteReadyWaiters.splice(index, 1);
-          }
-
-          reject(
-            new Error(
-              'The sender did not start direct P2P verification.'
-            )
-          );
-        }, DIRECT_READY_TIMEOUT);
-
-        this.remoteReadyWaiters.push({
-          resolve: () => {
-            window.clearTimeout(deadline);
-            resolve();
-          },
-          reject,
-        });
-      });
+    } catch (error) {
+      this.localReadySent = false;
+      throw error;
     }
+  }
+
+  private markRemoteReady(): void {
+    this.remoteReady = true;
+
+    this.remoteReadyWaiters.splice(0).forEach((waiter) => {
+      waiter.resolve();
+    });
+  }
+
+  private async waitForRemoteReady(): Promise<void> {
+    if (this.remoteReady) return;
+
+    const waiter = createDeferred();
+
+    this.remoteReadyWaiters.push(waiter);
+
+    await waiter.promise;
+  }
+
+  private assertDirectType(
+    type: DirectCandidateType
+  ): DirectConnectionType {
+    if (type === 'host' || type === 'srflx' || type === 'prflx') {
+      return type;
+    }
+
+    throw new Error('The direct connection type is unknown.');
+  }
+
+  /**
+   * 'prflx' (peer reflexive) is a direct, NAT-traversed path. It is reported as
+   * 'srflx' so the existing TransferState union does not have to change.
+   */
+  private reportedConnectionType(): ReportedConnectionType {
+    if (this.directCandidateType === 'prflx') {
+      return 'srflx';
+    }
+
+    return this.directCandidateType;
   }
 
   private async getSelectedCandidateType(): Promise<DirectCandidateType> {
@@ -571,150 +602,110 @@ export class WebRTCService {
 
     const stats = await this.peerConnection.getStats();
 
-    let selectedPair: CandidatePairLike | undefined;
-
+    const pairs = new Map<string, CandidatePairLike>();
     const candidates = new Map<string, CandidateLike>();
 
-    stats.forEach((report) => {
-      if (
-        report.type === 'candidate-pair' &&
-        (report as RTCIceCandidatePairStats).state === 'succeeded'
-      ) {
-        const pair =
-          report as unknown as CandidatePairLike;
+    let selectedPairId: string | undefined;
 
-        if (
-          pair.selected ||
-          pair.nominated
-        ) {
-          selectedPair = pair;
+    stats.forEach((report) => {
+      const entry = report as unknown as StatsLike;
+
+      if (entry.type === 'transport') {
+        const pairId = entry.selectedCandidatePairId;
+
+        if (typeof pairId === 'string') {
+          selectedPairId = pairId;
         }
       }
 
+      if (entry.type === 'candidate-pair') {
+        pairs.set(entry.id, entry as unknown as CandidatePairLike);
+      }
+
       if (
-        report.type === 'local-candidate' ||
-        report.type === 'remote-candidate'
+        entry.type === 'local-candidate' ||
+        entry.type === 'remote-candidate'
       ) {
-        candidates.set(
-          report.id,
-          report as unknown as CandidateLike
-        );
+        candidates.set(entry.id, entry as unknown as CandidateLike);
       }
     });
 
-    if (!selectedPair) {
+    /**
+     * Preferred source of truth: transport.selectedCandidatePairId.
+     * Fallbacks cover browsers that only expose `nominated` (Chromium) or
+     * `selected` (Firefox), and finally any succeeded pair once the peer
+     * connection itself reports 'connected'.
+     */
+    let pair = selectedPairId ? pairs.get(selectedPairId) : undefined;
+
+    if (!pair) {
+      for (const candidatePair of pairs.values()) {
+        if (
+          candidatePair.state === 'succeeded' &&
+          (candidatePair.selected || candidatePair.nominated)
+        ) {
+          pair = candidatePair;
+          break;
+        }
+      }
+    }
+
+    if (!pair && this.peerConnection.connectionState === 'connected') {
+      for (const candidatePair of pairs.values()) {
+        if (candidatePair.state === 'succeeded') {
+          pair = candidatePair;
+          break;
+        }
+      }
+    }
+
+    if (!pair) {
       return 'unknown';
     }
 
-    const local = candidates.get(
-      selectedPair.localCandidateId
+    const localType = pair.localCandidateId
+      ? candidates.get(pair.localCandidateId)?.candidateType
+      : undefined;
+
+    const remoteType = pair.remoteCandidateId
+      ? candidates.get(pair.remoteCandidateId)?.candidateType
+      : undefined;
+
+    const types = [localType, remoteType].filter(
+      (value): value is string => typeof value === 'string'
     );
 
-    const remote = candidates.get(
-      selectedPair.remoteCandidateId
-    );
+    if (types.length === 0) {
+      return 'unknown';
+    }
 
-    const localType =
-      local?.candidateType as DirectCandidateType | undefined;
-
-    const remoteType =
-      remote?.candidateType as DirectCandidateType | undefined;
-
-    if (
-      localType === 'relay' ||
-      remoteType === 'relay'
-    ) {
+    if (types.includes('relay')) {
       return 'relay';
     }
 
-    if (
-      localType === 'host' ||
-      remoteType === 'host'
-    ) {
+    if (types.every((value) => value === 'host')) {
       return 'host';
     }
 
-    if (
-      localType === 'srflx' ||
-      remoteType === 'srflx'
-    ) {
+    if (types.includes('srflx')) {
       return 'srflx';
+    }
+
+    if (types.includes('prflx')) {
+      return 'prflx';
+    }
+
+    if (types.includes('host')) {
+      return 'host';
     }
 
     return 'unknown';
   }
 
-  private async processPendingCandidates(): Promise<void> {
-    if (
-      !this.peerConnection ||
-      !this.peerConnection.remoteDescription
-    ) {
-      return;
-    }
-
-    while (this.pendingCandidates.length > 0) {
-      const candidate =
-        this.pendingCandidates.shift();
-
-      if (candidate) {
-        await this.addIceCandidate(candidate);
-      }
-    }
-  }
-
-  private startTransferWatchdog(): void {
-    this.stopTransferWatchdog();
-
-    this.lastTransferActivity = Date.now();
-
-    this.transferWatchdogId = window.setInterval(() => {
-      if (!this.peerConnection || !this.dataChannel) {
-        return;
-      }
-
-      if (
-        this.peerConnection.connectionState === 'connected' &&
-        this.dataChannel.readyState === 'open'
-      ) {
-        if (
-          Date.now() - this.lastTransferActivity >
-          TRANSFER_STALL_TIMEOUT
-        ) {
-          this.stopTransferWatchdog();
-
-          this.failTransfer(
-            'Transfer stalled. The direct connection may have dropped.'
-          );
-        }
-      }
-    }, TRANSFER_WATCHDOG_INTERVAL);
-  }
-
-  private resetTransferWatchdog(): void {
-    if (this.transferWatchdogId !== null) {
-      this.lastTransferActivity = Date.now();
-    }
-  }
-
-  private stopTransferWatchdog(): void {
-    if (this.transferWatchdogId !== null) {
-      window.clearInterval(
-        this.transferWatchdogId
-      );
-
-      this.transferWatchdogId = null;
-    }
-
-    this.lastTransferActivity = 0;
-  }
-
-  private setupDataChannel(
-    channel: RTCDataChannel
-  ): void {
+  private setupDataChannel(channel: RTCDataChannel): void {
     channel.binaryType = 'arraybuffer';
 
-    channel.bufferedAmountLowThreshold =
-      DATA_CHANNEL_LOW_WATER_MARK;
+    channel.bufferedAmountLowThreshold = DATA_CHANNEL_LOW_WATER_MARK;
 
     channel.onopen = () => {
       this.channelOpened = true;
@@ -728,46 +719,21 @@ export class WebRTCService {
     };
 
     channel.onmessage = (event) => {
-      this.handleIncomingData(event.data);
+      this.handleIncomingData(event.data as string | ArrayBuffer);
     };
 
     channel.onerror = () => {
-      if (!this.intentionallyClosing) {
-        this.failConnection(
-          'The direct data channel encountered an error.'
-        );
-      }
+      this.failConnection('The direct data channel encountered an error.');
     };
 
     channel.onclose = () => {
       this.channelOpened = false;
 
-      /**
-       * Ignore close events generated by our own cleanup.
-       */
-      if (this.intentionallyClosing) {
+      if (this.isClosed) {
         return;
       }
 
-      /**
-       * IMPORTANT:
-       *
-       * Do not automatically use the old:
-       *
-       * "closed before verification"
-       *
-       * logic.
-       *
-       * The close event can race with the verification
-       * handshake.
-       */
       if (!this.directConnectionVerified) {
-        this.rejectPendingOperations(
-          new Error(
-            'The direct data channel closed before P2P verification completed.'
-          )
-        );
-
         this.failConnection(
           'The direct data channel closed before direct P2P verification completed.'
         );
@@ -775,190 +741,227 @@ export class WebRTCService {
         return;
       }
 
-      this.failTransfer(
-        'The direct data channel closed during file transfer.'
-      );
+      this.failTransfer('The direct data channel closed during file transfer.');
     };
   }
 
+  private assertChannelOpen(): RTCDataChannel {
+    if (!this.dataChannel || this.dataChannel.readyState !== 'open') {
+      throw new Error('Direct data channel is not open.');
+    }
+
+    return this.dataChannel;
+  }
+
   public async sendFiles(
-    files: Array<{
-      file: File;
-      relativePath?: string;
-    }>
+    files: Array<{ file: File; relativePath?: string }>
   ): Promise<void> {
     await this.verifyDirectConnection();
 
-    /**
-     * Initiator performs the handshake.
-     *
-     * Receiver has already responded with DIRECT_READY_ACK.
-     */
-    if (!this.isInitiator) {
-      await this.waitForRemoteReady();
-    }
-
-    if (
-      !this.dataChannel ||
-      this.dataChannel.readyState !== 'open'
-    ) {
-      throw new Error(
-        'Direct data channel is not open.'
-      );
-    }
-
-    this.startTime = Date.now();
-    this.lastSpeedCheckTime = Date.now();
-    this.lastBytesCount = 0;
-
-    this.startTransferWatchdog();
+    this.assertChannelOpen();
 
     try {
-      for (
-        let fileIndex = 0;
-        fileIndex < files.length;
-        fileIndex += 1
-      ) {
-        const {
-          file,
-          relativePath,
-        } = files[fileIndex];
+      for (let fileIndex = 0; fileIndex < files.length; fileIndex += 1) {
+        const entry = files[fileIndex];
 
-        const totalChunks =
-          Math.ceil(file.size / CHUNK_SIZE);
-
-        const fileId =
-          `${file.name}-${file.size}-${Date.now()}-${fileIndex}`;
-
-        const startMessage: FileStartMessage = {
-          type: 'FILE_START',
-          fileId,
-          fileName: file.name,
-          relativePath,
-          fileSize: file.size,
-          fileType:
-            file.type ||
-            'application/octet-stream',
-          totalChunks,
-          checksumAlgorithm: 'fnv1a32',
-        };
-
-        await this.sendData(
-          JSON.stringify(startMessage)
-        );
-
-        let offset = 0;
-        let chunkIndex = 0;
-
-        let checksum = 0x811c9dc5;
-
-        while (offset < file.size) {
-          if (
-            !this.dataChannel ||
-            this.dataChannel.readyState !== 'open'
-          ) {
-            throw new Error(
-              'The direct data channel closed during transfer.'
-            );
-          }
-
-          const buffer =
-            await file
-              .slice(
-                offset,
-                offset + CHUNK_SIZE
-              )
-              .arrayBuffer();
-
-          const chunkMessage: FileChunkMessage = {
-            type: 'FILE_CHUNK',
-            fileId,
-            chunkIndex,
-            byteLength: buffer.byteLength,
-          };
-
-          /**
-           * Send metadata first.
-           */
-          await this.sendData(
-            JSON.stringify(chunkMessage)
-          );
-
-          /**
-           * Then send the binary chunk.
-           */
-          await this.sendData(buffer);
-
-          checksum = updateChecksum(
-            checksum,
-            new Uint8Array(buffer)
-          );
-
-          /**
-           * Wait for receiver-level acknowledgement.
-           *
-           * This is the important reliability improvement.
-           */
-          await this.waitForChunkAck(
-            fileId,
-            chunkIndex
-          );
-
-          offset += buffer.byteLength;
-          chunkIndex += 1;
-
-          this.updateStats(
-            offset,
-            file.size,
-            file.name,
-            fileIndex + 1,
-            files.length
-          );
-        }
-
-        const endMessage: FileEndMessage = {
-          type: 'FILE_END',
-          fileId,
-          checksum:
-            checksumToString(checksum),
-        };
-
-        await this.sendData(
-          JSON.stringify(endMessage)
-        );
-
-        /**
-         * Wait until receiver reconstructs the file,
-         * verifies checksum and confirms it.
-         */
-        await this.waitForFileVerification(
-          fileId
+        await this.sendSingleFile(
+          entry.file,
+          entry.relativePath,
+          fileIndex,
+          files.length
         );
       }
-
-      this.stopTransferWatchdog();
 
       this.onProgressCallback?.({
         status: 'completed',
         progress: 100,
         timeRemaining: 0,
-        connectionType:
-          this.directCandidateType,
+        connectionType: this.reportedConnectionType(),
       });
     } catch (error) {
       this.failTransfer(
-        error instanceof Error
-          ? error.message
-          : 'File transfer failed.'
+        error instanceof Error ? error.message : 'File transfer failed.'
       );
 
       throw error;
     }
   }
 
-  public handleIncomingData(
-    data: string | ArrayBuffer
-  ): void {
+  private async sendSingleFile(
+    file: File,
+    relativePath: string | undefined,
+    fileIndex: number,
+    totalFiles: number
+  ): Promise<void> {
+    const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+
+    const fileId = `${file.name}-${file.size}-${Date.now()}-${fileIndex}`;
+
+    const displayName = relativePath || file.name;
+
+    const startMessage: FileStartMessage = {
+      type: 'FILE_START',
+      fileId,
+      fileName: file.name,
+      fileSize: file.size,
+      fileType: file.type || 'application/octet-stream',
+      totalChunks,
+      checksumAlgorithm: 'fnv1a32',
+    };
+
+    if (relativePath) {
+      startMessage.relativePath = relativePath;
+    }
+
+    /** Speed is measured per file, so the counters reset here. */
+    this.startTime = Date.now();
+    this.lastSpeedCheckTime = Date.now();
+    this.lastBytesCount = 0;
+    this.lastSpeed = 0;
+
+    await this.sendData(JSON.stringify(startMessage));
+
+    this.updateStats(0, file.size, displayName, fileIndex + 1, totalFiles);
+
+    let offset = 0;
+    let chunkIndex = 0;
+    let checksum = FNV_OFFSET_BASIS;
+
+    while (offset < file.size) {
+      this.assertChannelOpen();
+
+      const buffer = await file
+        .slice(offset, offset + CHUNK_SIZE)
+        .arrayBuffer();
+
+      const chunkMessage: FileChunkMessage = {
+        type: 'FILE_CHUNK',
+        fileId,
+        chunkIndex,
+        byteLength: buffer.byteLength,
+      };
+
+      /** Registered before sending so the ACK can never arrive unobserved. */
+      this.trackChunkAck(fileId, chunkIndex);
+
+      try {
+        await this.sendData(JSON.stringify(chunkMessage));
+        await this.sendData(buffer);
+      } catch (error) {
+        this.discardChunkAck(fileId, chunkIndex);
+        throw error;
+      }
+
+      checksum = updateChecksum(checksum, new Uint8Array(buffer));
+
+      offset += buffer.byteLength;
+      chunkIndex += 1;
+
+      this.updateStats(
+        offset,
+        file.size,
+        displayName,
+        fileIndex + 1,
+        totalFiles
+      );
+
+      /** Keeps at most MAX_UNACKED_CHUNKS chunks outstanding. */
+      await this.drainChunkAcks(MAX_UNACKED_CHUNKS);
+    }
+
+    /** Every chunk must be acknowledged before the file is closed out. */
+    await this.drainChunkAcks(0);
+
+    const finalChecksum = checksumToString(checksum);
+
+    const endMessage: FileEndMessage = {
+      type: 'FILE_END',
+      fileId,
+      checksum: finalChecksum,
+    };
+
+    const verification = this.trackFileVerification(fileId, finalChecksum);
+
+    await this.sendData(JSON.stringify(endMessage));
+
+    /** Waits until the receiver reconstructed and verified the whole file. */
+    await verification;
+  }
+
+  private chunkAckKey(fileId: string, chunkIndex: number): string {
+    return `${fileId}:${chunkIndex}`;
+  }
+
+  private trackChunkAck(fileId: string, chunkIndex: number): void {
+    this.pendingChunkAcks.set(
+      this.chunkAckKey(fileId, chunkIndex),
+      createDeferred()
+    );
+  }
+
+  private discardChunkAck(fileId: string, chunkIndex: number): void {
+    this.pendingChunkAcks.delete(this.chunkAckKey(fileId, chunkIndex));
+  }
+
+  /**
+   * Waits until no more than `limit` chunks are still unacknowledged. Map
+   * iteration order is insertion order, so the oldest outstanding chunk is
+   * always the one awaited.
+   */
+  private async drainChunkAcks(limit: number): Promise<void> {
+    while (this.pendingChunkAcks.size > limit) {
+      const oldest = this.pendingChunkAcks.values().next().value;
+
+      if (!oldest) return;
+
+      await oldest.promise;
+    }
+  }
+
+  private resolveChunkAck(fileId: string, chunkIndex: number): void {
+    const key = this.chunkAckKey(fileId, chunkIndex);
+
+    const pending = this.pendingChunkAcks.get(key);
+
+    if (!pending) return;
+
+    this.pendingChunkAcks.delete(key);
+
+    pending.resolve();
+  }
+
+  private trackFileVerification(
+    fileId: string,
+    expectedChecksum: string
+  ): Promise<void> {
+    const deferred = createDeferred();
+
+    this.pendingFileVerification = { fileId, expectedChecksum, ...deferred };
+
+    return deferred.promise;
+  }
+
+  private resolveFileVerification(fileId: string, checksum: string): void {
+    const pending = this.pendingFileVerification;
+
+    if (!pending || pending.fileId !== fileId) return;
+
+    this.pendingFileVerification = null;
+
+    if (checksum !== pending.expectedChecksum) {
+      pending.reject(
+        new Error(
+          'The receiver reported a different checksum for the transferred file.'
+        )
+      );
+
+      return;
+    }
+
+    pending.resolve();
+  }
+
+  public handleIncomingData(data: string | ArrayBuffer): void {
     if (typeof data === 'string') {
       this.handleControlMessage(data);
       return;
@@ -968,195 +971,124 @@ export class WebRTCService {
       return;
     }
 
-    this.resetTransferWatchdog();
-
-    if (!this.directConnectionVerified) {
-      this.failTransfer(
-        'File data arrived before direct P2P verification.'
-      );
-
+    if (!this.localDirectConfirmed) {
+      this.failTransfer('File data arrived before direct P2P verification.');
       return;
     }
 
-    if (!this.currentFile) {
-      this.failTransfer(
-        'Received file data without an active file transfer.'
-      );
+    const current = this.currentFile;
 
+    if (!current) {
+      this.failTransfer('Received file data without an active file transfer.');
       return;
     }
 
-    const metadata =
-      this.currentFile.pendingChunkMetadata;
+    const metadata = current.pendingChunkMetadata;
 
     if (!metadata) {
-      this.failTransfer(
-        'Received binary data without FILE_CHUNK metadata.'
-      );
-
+      this.failTransfer('Received binary data without FILE_CHUNK metadata.');
       return;
     }
 
-    if (
-      metadata.fileId !==
-      this.currentFile.fileId
-    ) {
-      this.failTransfer(
-        'Received chunk belongs to an unexpected file.'
-      );
-
+    if (metadata.fileId !== current.fileId) {
+      this.failTransfer('Received chunk belongs to an unexpected file.');
       return;
     }
 
-    if (
-      metadata.chunkIndex !==
-      this.currentFile.expectedChunkIndex
-    ) {
-      this.failTransfer(
-        'Duplicate or out-of-order chunk received.'
-      );
-
+    if (metadata.chunkIndex !== current.expectedChunkIndex) {
+      this.failTransfer('Duplicate or out-of-order chunk received.');
       return;
     }
 
-    if (
-      metadata.byteLength !==
-      data.byteLength
-    ) {
-      this.failTransfer(
-        'Received chunk size does not match metadata.'
-      );
-
+    if (metadata.byteLength !== data.byteLength) {
+      this.failTransfer('Received chunk size does not match metadata.');
       return;
     }
 
-    this.currentFile.receivedChunks.set(
-      metadata.chunkIndex,
-      data
-    );
+    current.chunks.push(data);
+    current.receivedBytes += data.byteLength;
+    current.checksum = updateChecksum(current.checksum, new Uint8Array(data));
+    current.expectedChunkIndex += 1;
+    current.pendingChunkMetadata = null;
 
-    this.currentFile.receivedBytes +=
-      data.byteLength;
-
-    this.currentFile.checksum =
-      updateChecksum(
-        this.currentFile.checksum,
-        new Uint8Array(data)
-      );
-
-    this.currentFile.expectedChunkIndex += 1;
-
-    this.currentFile.pendingChunkMetadata =
-      null;
-
-    /**
-     * Application-level ACK.
-     */
+    /** Application-level ACK, drives the sender's in-flight window. */
     void this.sendData(
       JSON.stringify({
         type: 'FILE_CHUNK_ACK',
-        fileId: this.currentFile.fileId,
+        fileId: current.fileId,
         chunkIndex: metadata.chunkIndex,
       } satisfies FileChunkAckMessage)
     ).catch(() => {
-      this.failTransfer(
-        'Failed to acknowledge the received chunk.'
-      );
+      this.failTransfer('Failed to acknowledge the received chunk.');
     });
 
     this.updateStats(
-      this.currentFile.receivedBytes,
-      this.currentFile.fileSize,
-      this.currentFile.fileName
+      current.receivedBytes,
+      current.fileSize,
+      current.relativePath || current.fileName
     );
   }
 
-  private handleControlMessage(
-    data: string
-  ): void {
+  private handleControlMessage(data: string): void {
     let parsed: ControlMessage;
 
     try {
       parsed = JSON.parse(data) as ControlMessage;
     } catch {
-      this.failTransfer(
-        'Invalid transfer metadata received.'
-      );
-
+      this.failTransfer('Invalid transfer metadata received.');
       return;
     }
 
-    this.resetTransferWatchdog();
-
     switch (parsed.type) {
       case 'DIRECT_READY': {
-        this.receivedDirectReady = true;
-        this.remoteReady = true;
+        this.markRemoteReady();
 
-        /**
-         * Receiver responds immediately.
-         */
         void this.sendData(
           JSON.stringify({
             type: 'DIRECT_READY_ACK',
           } satisfies DirectReadyAckMessage)
         ).catch(() => {
           this.failConnection(
-            'Failed to acknowledge direct P2P verification.'
+            'Failed to acknowledge the direct P2P connection.'
           );
         });
 
-        this.remoteReadyWaiters
-          .splice(0)
-          .forEach((waiter) => {
-            waiter.resolve();
-          });
+        /**
+         * The peer is ready. Confirm our own candidate pair (and reject relay)
+         * even if this side never calls verifyDirectConnection() itself, which
+         * is the normal case for a pure receiver.
+         */
+        if (!this.directConnectionVerified) {
+          void this.verifyDirectConnection().catch(() => undefined);
+        }
 
         break;
       }
 
       case 'DIRECT_READY_ACK': {
-        if (
-          this.pendingDirectVerification
-        ) {
-          const pending =
-            this.pendingDirectVerification;
-
-          this.pendingDirectVerification =
-            null;
-
-          window.clearTimeout(
-            pending.timeoutId
-          );
-
-          pending.resolve();
-        }
-
-        break;
-      }
-
-      case 'DIRECT_VERIFIED': {
-        this.directConnectionVerified = true;
-
-        if (
-          this.connectionTimeoutId !== null
-        ) {
-          window.clearTimeout(
-            this.connectionTimeoutId
-          );
-
-          this.connectionTimeoutId = null;
-        }
-
+        /**
+         * Liveness echo only. Readiness is NOT taken from the ACK: a peer acks
+         * immediately, before it has inspected its own candidate pair, so
+         * treating the ACK as readiness let data start flowing while the peer
+         * was still verifying. Only the peer's own DIRECT_READY counts.
+         */
         break;
       }
 
       case 'FILE_START': {
+        if (this.currentFile) {
+          this.failTransfer(
+            'A new file started before the previous one finished.'
+          );
+
+          return;
+        }
+
         this.currentFile = {
           ...parsed,
-          receivedChunks: new Map(),
+          chunks: [],
           receivedBytes: 0,
-          checksum: 0x811c9dc5,
+          checksum: FNV_OFFSET_BASIS,
           expectedChunkIndex: 0,
           pendingChunkMetadata: null,
         };
@@ -1164,14 +1096,11 @@ export class WebRTCService {
         this.startTime = Date.now();
         this.lastSpeedCheckTime = Date.now();
         this.lastBytesCount = 0;
-
-        this.startTransferWatchdog();
+        this.lastSpeed = 0;
 
         this.onProgressCallback?.({
           status: 'transferring',
-          currentFileName:
-            parsed.relativePath ||
-            parsed.fileName,
+          currentFileName: parsed.relativePath || parsed.fileName,
           fileSize: parsed.fileSize,
           transferredBytes: 0,
           progress: 0,
@@ -1182,93 +1111,61 @@ export class WebRTCService {
       }
 
       case 'FILE_CHUNK': {
-        if (
-          !this.currentFile ||
-          this.currentFile.fileId !==
-            parsed.fileId
-        ) {
+        const current = this.currentFile;
+
+        if (!current || current.fileId !== parsed.fileId) {
+          this.failTransfer('Invalid or missing file chunk metadata.');
+          return;
+        }
+
+        if (parsed.chunkIndex !== current.expectedChunkIndex) {
+          this.failTransfer('Invalid chunk index received.');
+          return;
+        }
+
+        if (current.pendingChunkMetadata) {
           this.failTransfer(
-            'Invalid or missing file chunk metadata.'
+            'Received new chunk metadata before the previous chunk was processed.'
           );
 
           return;
         }
 
-        if (
-          parsed.chunkIndex !==
-          this.currentFile.expectedChunkIndex
-        ) {
-          this.failTransfer(
-            'Invalid chunk index received.'
-          );
-
-          return;
-        }
-
-        if (
-          this.currentFile.pendingChunkMetadata
-        ) {
-          this.failTransfer(
-            'Received new chunk metadata before previous chunk was processed.'
-          );
-
-          return;
-        }
-
-        this.currentFile.pendingChunkMetadata =
-          parsed;
+        current.pendingChunkMetadata = parsed;
 
         break;
       }
 
       case 'FILE_CHUNK_ACK': {
-        this.resolveChunkAck(
-          parsed.fileId,
-          parsed.chunkIndex
-        );
-
+        this.resolveChunkAck(parsed.fileId, parsed.chunkIndex);
         break;
       }
 
       case 'FILE_END': {
         this.finishReceivedFile(parsed);
-
         break;
       }
 
       case 'FILE_VERIFIED': {
-        this.resolveFileVerification(
-          parsed.fileId,
-          parsed.checksum
-        );
-
+        this.resolveFileVerification(parsed.fileId, parsed.checksum);
         break;
       }
 
       case 'FILE_ERROR': {
-        this.rejectPendingOperations(
-          new Error(parsed.error)
-        );
-
-        this.failTransfer(
-          parsed.error
-        );
-
+        this.failTransfer(parsed.error);
         break;
       }
+
+      default:
+        break;
     }
   }
 
-  private finishReceivedFile(
-    message: FileEndMessage
-  ): void {
+  private finishReceivedFile(message: FileEndMessage): void {
     const current = this.currentFile;
 
-    if (
-      !current ||
-      current.fileId !== message.fileId
-    ) {
-      this.sendFileError(
+    if (!current || current.fileId !== message.fileId) {
+      this.rejectReceivedFile(
         message.fileId,
         'Received FILE_END for an unknown file.'
       );
@@ -1276,55 +1173,8 @@ export class WebRTCService {
       return;
     }
 
-    if (
-      current.receivedChunks.size !==
-      current.totalChunks
-    ) {
-      this.sendFileError(
-        current.fileId,
-        'Not all file chunks were received.'
-      );
-
-      return;
-    }
-
-    if (
-      current.receivedBytes !==
-      current.fileSize
-    ) {
-      this.sendFileError(
-        current.fileId,
-        'Received file size does not match the expected size.'
-      );
-
-      return;
-    }
-
-    const calculatedChecksum =
-      checksumToString(
-        current.checksum
-      );
-
-    if (
-      calculatedChecksum !==
-      message.checksum
-    ) {
-      this.sendFileError(
-        current.fileId,
-        'File integrity check failed. The transfer was discarded.'
-      );
-
-      this.failTransfer(
-        'File integrity check failed. The transfer was discarded.'
-      );
-
-      return;
-    }
-
-    if (
-      current.pendingChunkMetadata
-    ) {
-      this.sendFileError(
+    if (current.pendingChunkMetadata) {
+      this.rejectReceivedFile(
         current.fileId,
         'A file chunk was not completely received.'
       );
@@ -1332,24 +1182,44 @@ export class WebRTCService {
       return;
     }
 
-    const chunks =
-      Array.from(
-        current.receivedChunks.entries()
-      )
-        .sort(([a], [b]) => a - b)
-        .map(([, chunk]) => chunk);
+    if (current.chunks.length !== current.totalChunks) {
+      this.rejectReceivedFile(
+        current.fileId,
+        'Not all file chunks were received.'
+      );
+
+      return;
+    }
+
+    if (current.receivedBytes !== current.fileSize) {
+      this.rejectReceivedFile(
+        current.fileId,
+        'Received file size does not match the expected size.'
+      );
+
+      return;
+    }
+
+    const calculatedChecksum = checksumToString(current.checksum);
+
+    if (calculatedChecksum !== message.checksum) {
+      this.rejectReceivedFile(
+        current.fileId,
+        'File integrity check failed. The transfer was discarded.'
+      );
+
+      return;
+    }
 
     this.downloadFile(
-      chunks,
-      current.relativePath ||
-        current.fileName,
+      current.chunks,
+      current.relativePath || current.fileName,
       current.fileType
     );
 
-    /**
-     * Tell sender that the entire file has
-     * been reconstructed and verified.
-     */
+    this.currentFile = null;
+
+    /** Tells the sender the file was fully reconstructed and verified. */
     void this.sendData(
       JSON.stringify({
         type: 'FILE_VERIFIED',
@@ -1362,61 +1232,53 @@ export class WebRTCService {
       );
     });
 
-    this.currentFile = null;
-
     this.onProgressCallback?.({
       status: 'completed',
       progress: 100,
       timeRemaining: 0,
-      connectionType:
-        this.directCandidateType,
+      connectionType: this.reportedConnectionType(),
     });
   }
 
-  private async sendData(
-    data: string | ArrayBuffer
-  ): Promise<void> {
-    const channel = this.dataChannel;
+  /**
+   * Reports a receive-side failure to the sender and locally. The channel state
+   * is unrecoverable at this point, so both sides tear down.
+   */
+  private rejectReceivedFile(fileId: string | undefined, error: string): void {
+    const payload: FileErrorMessage = { type: 'FILE_ERROR', error };
 
-    if (
-      !channel ||
-      channel.readyState !== 'open'
-    ) {
-      throw new Error(
-        'Direct data channel is not open.'
-      );
+    if (fileId) {
+      payload.fileId = fileId;
     }
+
+    void this.sendData(JSON.stringify(payload)).catch(() => undefined);
+
+    this.failTransfer(error);
+  }
+
+  private async sendData(data: string | ArrayBuffer): Promise<void> {
+    const channel = this.assertChannelOpen();
 
     const byteLength =
       typeof data === 'string'
-        ? new TextEncoder()
-            .encode(data)
-            .byteLength
+        ? new TextEncoder().encode(data).byteLength
         : data.byteLength;
 
-    const deadline =
-      Date.now() + QUEUE_WAIT_TIMEOUT;
-
+    /**
+     * Backpressure only: this loop waits for buffer space for as long as the
+     * channel stays open. It never gives up on a deadline.
+     */
     while (
-      channel.bufferedAmount +
-        byteLength >
+      channel.bufferedAmount + byteLength >
       DATA_CHANNEL_HIGH_WATER_MARK
     ) {
-      if (
-        Date.now() >= deadline
-      ) {
-        throw new Error(
-          'The direct data channel stayed full for too long.'
-        );
+      await this.waitForBufferedAmountLow(channel);
+
+      if (this.isClosed) {
+        throw new Error('The transfer was closed while waiting for buffer space.');
       }
 
-      await this.waitForBufferedAmountLow(
-        channel
-      );
-
-      if (
-        channel.readyState !== 'open'
-      ) {
+      if (channel.readyState !== 'open') {
         throw new Error(
           'The direct data channel closed while waiting for buffer space.'
         );
@@ -1425,8 +1287,6 @@ export class WebRTCService {
 
     try {
       channel.send(data);
-
-      this.resetTransferWatchdog();
     } catch (error) {
       throw new Error(
         error instanceof Error
@@ -1439,10 +1299,7 @@ export class WebRTCService {
   private async waitForBufferedAmountLow(
     channel: RTCDataChannel
   ): Promise<void> {
-    if (
-      channel.bufferedAmount <=
-      DATA_CHANNEL_LOW_WATER_MARK
-    ) {
+    if (channel.bufferedAmount <= DATA_CHANNEL_LOW_WATER_MARK) {
       return;
     }
 
@@ -1454,14 +1311,9 @@ export class WebRTCService {
 
         settled = true;
 
-        window.clearTimeout(
-          timer
-        );
+        window.clearTimeout(timer);
 
-        channel.removeEventListener(
-          'bufferedamountlow',
-          onLow
-        );
+        channel.removeEventListener('bufferedamountlow', onLow);
 
         resolve();
       };
@@ -1470,264 +1322,41 @@ export class WebRTCService {
         cleanup();
       };
 
-      const timer =
-        window.setTimeout(
-          cleanup,
-          120
-        );
+      /** Wake-up only; the caller re-checks the buffer and keeps waiting. */
+      const timer = window.setTimeout(cleanup, BUFFER_WAKEUP_INTERVAL);
 
-      channel.addEventListener(
-        'bufferedamountlow',
-        onLow,
-        { once: true }
-      );
+      channel.addEventListener('bufferedamountlow', onLow, { once: true });
 
-      /**
-       * Prevent race where buffer becomes low
-       * between the initial check and listener setup.
-       */
-      if (
-        channel.bufferedAmount <=
-        DATA_CHANNEL_LOW_WATER_MARK
-      ) {
+      /** Covers the race where the buffer drains before the listener attaches. */
+      if (channel.bufferedAmount <= DATA_CHANNEL_LOW_WATER_MARK) {
         cleanup();
       }
     });
   }
 
-  private async waitForRemoteReady(): Promise<void> {
-    if (this.remoteReady) {
-      return;
-    }
-
-    await new Promise<void>(
-      (resolve, reject) => {
-        const timeout =
-          window.setTimeout(() => {
-            const index =
-              this.remoteReadyWaiters.findIndex(
-                (item) =>
-                  item.resolve === resolve
-              );
-
-            if (index >= 0) {
-              this.remoteReadyWaiters.splice(
-                index,
-                1
-              );
-            }
-
-            reject(
-              new Error(
-                'The recipient did not verify the direct P2P connection.'
-              )
-            );
-          }, DIRECT_READY_TIMEOUT);
-
-        this.remoteReadyWaiters.push({
-          resolve: () => {
-            window.clearTimeout(
-              timeout
-            );
-
-            resolve();
-          },
-          reject,
-        });
-      }
-    );
-  }
-
-  private async waitForChunkAck(
-    fileId: string,
-    chunkIndex: number
-  ): Promise<void> {
-    const key =
-      `${fileId}:${chunkIndex}`;
-
-    await new Promise<void>(
-      (resolve, reject) => {
-        const timeoutId =
-          window.setTimeout(() => {
-            this.pendingChunkAcks.delete(
-              key
-            );
-
-            reject(
-              new Error(
-                `Chunk ${chunkIndex + 1} was not acknowledged by the receiver.`
-              )
-            );
-          }, CHUNK_ACK_TIMEOUT);
-
-        this.pendingChunkAcks.set(
-          key,
-          {
-            fileId,
-            chunkIndex,
-            resolve,
-            reject,
-            timeoutId,
-          }
-        );
-      }
-    );
-  }
-
-  private resolveChunkAck(
-    fileId: string,
-    chunkIndex: number
-  ): void {
-    const key =
-      `${fileId}:${chunkIndex}`;
-
-    const pending =
-      this.pendingChunkAcks.get(key);
-
-    if (!pending) {
-      return;
-    }
-
-    window.clearTimeout(
-      pending.timeoutId
-    );
-
-    this.pendingChunkAcks.delete(
-      key
-    );
-
-    pending.resolve();
-  }
-
-  private async waitForFileVerification(
-    fileId: string
-  ): Promise<void> {
-    await new Promise<void>(
-      (resolve, reject) => {
-        const timeoutId =
-          window.setTimeout(() => {
-            if (
-              this.pendingFileVerification
-                ?.fileId === fileId
-            ) {
-              this.pendingFileVerification =
-                null;
-            }
-
-            reject(
-              new Error(
-                'The receiver did not confirm final file verification.'
-              )
-            );
-          }, FILE_VERIFICATION_TIMEOUT);
-
-        this.pendingFileVerification = {
-          fileId,
-          resolve,
-          reject,
-          timeoutId,
-        };
-      }
-    );
-  }
-
-  private resolveFileVerification(
-    fileId: string,
-    checksum: string
-  ): void {
-    const pending =
-      this.pendingFileVerification;
-
-    if (
-      !pending ||
-      pending.fileId !== fileId
-    ) {
-      return;
-    }
-
-    window.clearTimeout(
-      pending.timeoutId
-    );
-
-    this.pendingFileVerification =
-      null;
-
-    pending.resolve();
-
-    this.onProgressCallback?.({
-      status: 'transferring',
-      serverRole: 'signaling-only',
-    });
-  }
-
-  private sendFileError(
-    fileId: string,
-    error: string
-  ): void {
-    void this.sendData(
-      JSON.stringify({
-        type: 'FILE_ERROR',
-        fileId,
-        error,
-      } satisfies FileErrorMessage)
-    ).catch(() => {
-      // Connection may already be closed.
-    });
-  }
-
-  private rejectPendingOperations(
-    error: Error
-  ): void {
-    if (
-      this.pendingDirectVerification
-    ) {
-      const pending =
-        this.pendingDirectVerification;
-
-      this.pendingDirectVerification =
-        null;
-
-      window.clearTimeout(
-        pending.timeoutId
-      );
-
-      pending.reject(error);
-    }
-
-    for (
-      const pending of
-      this.pendingChunkAcks.values()
-    ) {
-      window.clearTimeout(
-        pending.timeoutId
-      );
-
+  /**
+   * Every await in this service is released here. With no timeouts, this is the
+   * single escape hatch for pending operations, so it must be called from every
+   * failure and from close().
+   */
+  private rejectPendingOperations(error: Error): void {
+    for (const pending of this.pendingChunkAcks.values()) {
       pending.reject(error);
     }
 
     this.pendingChunkAcks.clear();
 
-    if (
-      this.pendingFileVerification
-    ) {
-      const pending =
-        this.pendingFileVerification;
+    if (this.pendingFileVerification) {
+      const pending = this.pendingFileVerification;
 
-      this.pendingFileVerification =
-        null;
-
-      window.clearTimeout(
-        pending.timeoutId
-      );
+      this.pendingFileVerification = null;
 
       pending.reject(error);
     }
 
-    this.remoteReadyWaiters
-      .splice(0)
-      .forEach((waiter) => {
-        waiter.reject(error);
-      });
+    this.remoteReadyWaiters.splice(0).forEach((waiter) => {
+      waiter.reject(error);
+    });
   }
 
   private updateStats(
@@ -1739,57 +1368,57 @@ export class WebRTCService {
   ): void {
     const now = Date.now();
 
-    const timeDelta =
-      (now - this.lastSpeedCheckTime) /
-      1000;
+    const timeDelta = (now - this.lastSpeedCheckTime) / 1000;
 
-    let speed = 0;
-
+    /**
+     * Speed is recomputed at most a few times per second. In between, the last
+     * measured value is reused instead of reporting 0, which made the UI flicker.
+     */
     if (timeDelta > 0.3) {
-      speed =
-        (currentTransferred -
-          this.lastBytesCount) /
-        timeDelta;
+      this.lastSpeed = (currentTransferred - this.lastBytesCount) / timeDelta;
 
-      this.lastSpeedCheckTime =
-        now;
-
-      this.lastBytesCount =
-        currentTransferred;
+      this.lastSpeedCheckTime = now;
+      this.lastBytesCount = currentTransferred;
     }
 
-    const remainingBytes =
-      Math.max(
-        0,
-        totalSize -
-          currentTransferred
-      );
+    const speed = this.resolveSpeed(currentTransferred, now);
+
+    const remainingBytes = Math.max(0, totalSize - currentTransferred);
 
     this.onProgressCallback?.({
       currentFileName: fileName,
       currentFileIndex,
       totalFiles,
       fileSize: totalSize,
-      transferredBytes:
-        currentTransferred,
+      transferredBytes: currentTransferred,
       progress:
         totalSize > 0
-          ? Math.min(
-              100,
-              (currentTransferred /
-                totalSize) *
-                100
-            )
+          ? Math.min(100, (currentTransferred / totalSize) * 100)
           : 100,
       speed,
-      timeRemaining:
-        speed > 0
-          ? remainingBytes / speed
-          : 0,
-      connectionType:
-        this.directCandidateType,
+      timeRemaining: speed > 0 ? remainingBytes / speed : 0,
+      connectionType: this.reportedConnectionType(),
       serverRole: 'signaling-only',
     });
+  }
+
+  /**
+   * Instantaneous speed when available, average since the current file started
+   * otherwise (the first samples of a file have no instantaneous value yet).
+   */
+  private resolveSpeed(currentTransferred: number, now: number): number {
+    if (this.lastSpeed > 0) {
+      return this.lastSpeed;
+    }
+
+    const elapsedSeconds =
+      this.startTime > 0 ? (now - this.startTime) / 1000 : 0;
+
+    if (elapsedSeconds > 0.5 && currentTransferred > 0) {
+      return currentTransferred / elapsedSeconds;
+    }
+
+    return 0;
   }
 
   private downloadFile(
@@ -1797,90 +1426,57 @@ export class WebRTCService {
     fileName: string,
     fileType: string
   ): void {
-    const blob = new Blob(
-      chunks,
-      {
-        type:
-          fileType ||
-          'application/octet-stream',
-      }
-    );
+    const blob = new Blob(chunks, {
+      type: fileType || 'application/octet-stream',
+    });
 
-    const url =
-      URL.createObjectURL(blob);
+    const url = URL.createObjectURL(blob);
 
-    const anchor =
-      document.createElement('a');
+    const anchor = document.createElement('a');
 
     anchor.href = url;
+    anchor.download = fileName.split('/').pop() || fileName;
 
-    anchor.download =
-      fileName.split('/').pop() ||
-      fileName;
-
-    document.body.appendChild(
-      anchor
-    );
+    document.body.appendChild(anchor);
 
     anchor.click();
 
-    document.body.removeChild(
-      anchor
-    );
+    document.body.removeChild(anchor);
 
+    /** Revoke after the browser picked the blob up. Not a failure deadline. */
     window.setTimeout(() => {
       URL.revokeObjectURL(url);
     }, 1_000);
   }
 
-  /**
-   * Used for actual connection failures.
-   *
-   * Unlike the old failDirectConnection(),
-   * this still works AFTER direct verification.
-   */
-  private failConnection(
-    message: string
-  ): void {
-    if (this.intentionallyClosing) {
-      return;
-    }
-
-    this.stopTransferWatchdog();
-
-    this.rejectPendingOperations(
-      new Error(message)
-    );
-
-    this.onProgressCallback?.({
-      status: 'failed',
-      error: message,
-      connectionType:
-        this.directCandidateType,
-      serverRole: 'signaling-only',
-    });
-
-    this.close();
+  /** Connection-level failure (ICE, channel, relay rejection). */
+  private failConnection(message: string): void {
+    this.fail(message);
   }
 
-  private failTransfer(
-    message: string
-  ): void {
-    if (this.intentionallyClosing) {
+  /** Transfer-level failure (protocol violation, integrity, peer error). */
+  private failTransfer(message: string): void {
+    this.fail(message);
+  }
+
+  private fail(message: string): void {
+    /**
+     * Sticky guards. close() no longer clears them, which is what previously
+     * let a single failure re-enter here through the close handlers and emit
+     * several 'failed' states for one root cause.
+     */
+    if (this.isClosed || this.hasFailed) {
       return;
     }
 
-    this.stopTransferWatchdog();
+    this.hasFailed = true;
 
-    this.rejectPendingOperations(
-      new Error(message)
-    );
+    this.rejectPendingOperations(new Error(message));
 
     this.onProgressCallback?.({
       status: 'failed',
       error: message,
-      connectionType:
-        this.directCandidateType,
+      connectionType: this.reportedConnectionType(),
       serverRole: 'signaling-only',
     });
 
@@ -1888,40 +1484,21 @@ export class WebRTCService {
   }
 
   public close(): void {
-    this.intentionallyClosing = true;
-
-    this.stopTransferWatchdog();
-
-    if (
-      this.connectionTimeoutId !== null
-    ) {
-      window.clearTimeout(
-        this.connectionTimeoutId
-      );
-
-      this.connectionTimeoutId =
-        null;
+    if (this.isClosed) {
+      return;
     }
 
-    this.rejectPendingOperations(
-      new Error(
-        'WebRTC transfer was closed.'
-      )
-    );
+    /** Sticky, so late close/error events are never reported as failures. */
+    this.isClosed = true;
+
+    this.rejectPendingOperations(new Error('WebRTC transfer was closed.'));
 
     if (this.dataChannel) {
       try {
-        this.dataChannel.onopen =
-          null;
-
-        this.dataChannel.onmessage =
-          null;
-
-        this.dataChannel.onerror =
-          null;
-
-        this.dataChannel.onclose =
-          null;
+        this.dataChannel.onopen = null;
+        this.dataChannel.onmessage = null;
+        this.dataChannel.onerror = null;
+        this.dataChannel.onclose = null;
 
         this.dataChannel.close();
       } catch {
@@ -1933,17 +1510,10 @@ export class WebRTCService {
 
     if (this.peerConnection) {
       try {
-        this.peerConnection.onicecandidate =
-          null;
-
-        this.peerConnection.oniceconnectionstatechange =
-          null;
-
-        this.peerConnection.onconnectionstatechange =
-          null;
-
-        this.peerConnection.ondatachannel =
-          null;
+        this.peerConnection.onicecandidate = null;
+        this.peerConnection.oniceconnectionstatechange = null;
+        this.peerConnection.onconnectionstatechange = null;
+        this.peerConnection.ondatachannel = null;
 
         this.peerConnection.close();
       } catch {
@@ -1955,64 +1525,44 @@ export class WebRTCService {
 
     this.channelOpened = false;
     this.directConnectionVerified = false;
+    this.localDirectConfirmed = false;
     this.directCandidateType = 'unknown';
+    this.verificationPromise = null;
 
     this.currentFile = null;
 
+    this.localReadySent = false;
     this.remoteReady = false;
-    this.receivedDirectReady = false;
-
     this.remoteReadyWaiters = [];
 
     this.pendingCandidates = [];
-
     this.pendingChunkAcks.clear();
     this.pendingFileVerification = null;
-    this.pendingDirectVerification = null;
-
-    this.intentionallyClosing = false;
   }
 }
 
-function updateChecksum(
-  current: number,
-  bytes: Uint8Array
-): number {
-  let checksum =
-    current >>> 0;
+/**
+ * FNV-1a (32-bit). The prime is 0x01000193 (16777619); the previous value
+ * 0x010001f3 was a typo. Both peers share this code, so checksums matched
+ * anyway, but the algorithm no longer matches its name and reference vectors.
+ */
+function updateChecksum(current: number, bytes: Uint8Array): number {
+  let checksum = current >>> 0;
 
-  for (const byte of bytes) {
-    checksum ^= byte;
-
-    checksum =
-      Math.imul(
-        checksum,
-        0x010001f3
-      ) >>> 0;
+  for (let index = 0; index < bytes.length; index += 1) {
+    checksum ^= bytes[index];
+    checksum = Math.imul(checksum, FNV_PRIME) >>> 0;
   }
 
   return checksum >>> 0;
 }
 
-function checksumToString(
-  checksum: number
-): string {
-  return (
-    checksum >>> 0
-  )
-    .toString(16)
-    .padStart(8, '0');
+function checksumToString(checksum: number): string {
+  return (checksum >>> 0).toString(16).padStart(8, '0');
 }
 
-function wait(
-  ms: number
-): Promise<void> {
-  return new Promise(
-    (resolve) => {
-      window.setTimeout(
-        resolve,
-        ms
-      );
-    }
-  );
+function wait(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, ms);
+  });
 }

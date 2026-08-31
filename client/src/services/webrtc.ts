@@ -1286,7 +1286,16 @@ export class WebRTCService {
     }
 
     try {
-      channel.send(data);
+      /**
+       * `RTCDataChannel.send` is an overload set (string | Blob | ArrayBuffer |
+       * ArrayBufferView). TypeScript cannot resolve an overload from a union
+       * argument, so each variant is dispatched on its own narrowed branch.
+       */
+      if (typeof data === 'string') {
+        channel.send(data);
+      } else {
+        channel.send(data);
+      }
     } catch (error) {
       throw new Error(
         error instanceof Error

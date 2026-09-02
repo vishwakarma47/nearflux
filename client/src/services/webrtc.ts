@@ -34,7 +34,15 @@ import { socketService } from './socket.js';
  * symmetric NAT) instead of reporting a bare "ICE connection failed".
  */
 
-const CHUNK_SIZE = 512 * 1024;
+/**
+ * Keep each SCTP message below the browser-to-browser default maximum. A
+ * 512 KiB message is rejected by Chromium on connections that negotiate a
+ * smaller maxMessageSize. 60 KiB is conservative for Chromium, Firefox,
+ * Safari, mobile browsers, and older SDP peers while still keeping message
+ * overhead low for large files.
+ */
+const CHUNK_SIZE = 60 * 1024;
+const MESSAGE_SIZE_HEADROOM = 4 * 1024;
 
 const DATA_CHANNEL_HIGH_WATER_MARK = 4 * 1024 * 1024;
 const DATA_CHANNEL_LOW_WATER_MARK = 1 * 1024 * 1024;
@@ -1034,7 +1042,8 @@ export class WebRTCService {
     fileIndex: number,
     totalFiles: number
   ): Promise<void> {
-    const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+    const chunkSize = this.getSafeChunkSize();
+    const totalChunks = Math.ceil(file.size / chunkSize);
 
     const fileId = `${file.name}-${file.size}-${Date.now()}-${fileIndex}`;
 
@@ -1072,7 +1081,7 @@ export class WebRTCService {
       this.assertChannelOpen();
 
       const buffer = await file
-        .slice(offset, offset + CHUNK_SIZE)
+        .slice(offset, offset + chunkSize)
         .arrayBuffer();
 
       const chunkMessage: FileChunkMessage = {
@@ -1497,6 +1506,21 @@ export class WebRTCService {
     this.failTransfer(error);
   }
 
+  /**
+   * SCTP exposes the negotiated message ceiling on newer browsers. Use it when
+   * available, but always retain a conservative fallback for browsers that do
+   * not expose RTCSctpTransport.maxMessageSize.
+   */
+  private getSafeChunkSize(): number {
+    const negotiated = this.peerConnection?.sctp?.maxMessageSize;
+
+    if (typeof negotiated === 'number' && Number.isFinite(negotiated) && negotiated > 0) {
+      return Math.max(8 * 1024, Math.min(CHUNK_SIZE, negotiated - MESSAGE_SIZE_HEADROOM));
+    }
+
+    return CHUNK_SIZE;
+  }
+
   private async sendData(data: string | ArrayBuffer): Promise<void> {
     const channel = this.assertChannelOpen();
 
@@ -1504,6 +1528,11 @@ export class WebRTCService {
       typeof data === 'string'
         ? new TextEncoder().encode(data).byteLength
         : data.byteLength;
+
+    const negotiated = this.peerConnection?.sctp?.maxMessageSize;
+    if (typeof negotiated === 'number' && negotiated > 0 && byteLength > negotiated) {
+      throw new Error(`The direct channel only accepts messages up to ${Math.floor(negotiated / 1024)} KiB.`);
+    }
 
     /**
      * Backpressure only: this loop waits for buffer space for as long as the

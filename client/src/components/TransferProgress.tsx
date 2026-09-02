@@ -19,7 +19,13 @@ export const TransferProgress: React.FC = () => {
     cancelled: 'Transfer was cancelled.',
     idle: '',
   }[transferState.status];
-  const statusLabel = transferState.status === 'failed' ? 'Direct P2P unavailable' : transferState.status === 'ready_for_transfer' || transferState.status === 'transferring' || transferState.status === 'completed' ? 'Direct P2P connection' : 'Direct P2P only';
+  const statusLabel = transferState.status === 'failed'
+    ? transferState.connectionType
+      ? 'Direct P2P connection interrupted'
+      : 'Direct P2P unavailable'
+    : transferState.status === 'ready_for_transfer' || transferState.status === 'transferring' || transferState.status === 'completed'
+      ? 'Direct P2P connection'
+      : 'Direct P2P only';
 
   return (
     <div className="transfer-modal-overlay" role="presentation">
@@ -35,7 +41,7 @@ export const TransferProgress: React.FC = () => {
           <div className="transfer-stats-row"><span className="progress-percent">{transferState.progress.toFixed(1)}%</span>{transferState.fileSize !== undefined && <span className="transferred-bytes">{formatBytes(transferState.transferredBytes)} / {formatBytes(transferState.fileSize)}</span>}</div>
           {transferState.status === 'transferring' && <div className="transfer-meta-row"><span><Gauge size={13} aria-hidden="true" /> <strong>Speed</strong> {formatSpeed(transferState.speed)}</span><span><strong>ETA</strong> {formatTime(transferState.timeRemaining)}</span></div>}
           {transferState.status === 'completed' && <div className="transfer-status-msg success" role="status"><CheckCircle size={17} aria-hidden="true" /> <span>Saved locally. The server received no file data.</span></div>}
-          {(transferState.status === 'failed' || transferState.status === 'cancelled') && <div className="transfer-status-msg error" role="alert"><AlertCircle size={17} aria-hidden="true" /> <span>{statusMessage} No relay or upload fallback is available.</span></div>}
+          {(transferState.status === 'failed' || transferState.status === 'cancelled') && <div className="transfer-status-msg error" role="alert"><AlertCircle size={17} aria-hidden="true" /> <span>{statusMessage}{transferState.status === 'failed' ? ' The transfer can be retried over a direct connection.' : ''}</span></div>}
         </div>
         <div className="transfer-actions"><button className="btn secondary danger-hover" type="button" onClick={closeOrCancel}>{ended ? 'Close' : 'Cancel transfer'}</button></div>
       </div>

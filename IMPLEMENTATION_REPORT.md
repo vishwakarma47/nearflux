@@ -1,39 +1,92 @@
-# NearFlux strict direct-P2P implementation report
+# NearFlux Telegram Integration — Implementation Report
 
-## Result
+## Executive summary
 
-NearFlux has been upgraded from global LAN discovery to ephemeral private rooms that can be joined through a `?room=FLUX-####` URL, a secret code, or a locally generated QR invite. The project remains deployment-ready and does not hard-code the provided Render URL.
+The existing NearFlux application was inspected first and extended in place. The original React/Vite frontend, Express server, Socket.IO room/signaling system, browser WebRTC transfer service, `/health` and `/healthz` endpoints, direct-path policy, DataChannel transfer behavior, and 10-minute keep-alive were preserved.
 
-The transfer architecture follows the strict requirement: the server handles room lifecycle, presence, transfer approval, SDP, ICE candidates, and cancellation only. File metadata and bytes are sent through the direct WebRTC DataChannel after both peers verify a direct `host` or `srflx` ICE path. TURN is not configured, relay candidates are rejected, and failed direct connectivity cancels the transfer without a fallback.
+The implementation adds an optional server-side Telegram Bot and WebRTC bridge. When `TELEGRAM_BOT_TOKEN` is not set, the integration is disabled and the existing application continues to run without Telegram code paths being activated. When enabled, the bot joins the same ephemeral room system as a named `NearFlux Telegram Bridge` device and uses the same Socket.IO room and signaling events as browser clients.
 
-## Main changes
+## Existing architecture preserved
 
-| Area | Implementation |
-|---|---|
-| Rooms | Added ephemeral in-memory rooms, creator tracking, join/leave/close, generated codes, room-scoped presence, and cleanup when the last device leaves. |
-| Invite flow | Added query-parameter room handling, copyable share links, locally rendered QR codes, join-by-code, room regeneration, and close-room controls. |
-| UI | Matched the supplied reference with device onboarding, private-room header and device section, file/folder dropzone, footer information dialogs, responsive styling, and direct-P2P status messaging. |
-| Transfer | Removed all Socket.IO file chunks and relay fallback branches. Added STUN-only ICE, relay-candidate rejection, selected candidate-pair verification, a two-sided direct-ready handshake, DataChannel chunking, cancellation, checksum validation, and unrestricted application-level throughput. The prior fixed 8 MB buffered-amount throttle was replaced with adaptive queue control: the sender waits only while the browser queue is full, then resumes immediately. There is still no application upload or download speed cap. The application chunk size is now 1 MB, selected as a safer throughput improvement over 128 KB without the larger browser-compatibility and retransmission risks of 2–5 MB messages. |
-| Configuration | Added `VITE_SIGNALING_URL` support for deployment flexibility and `FRONTEND_ORIGIN` support for server CORS configuration. |
+| Area | Existing behavior retained |
+| --- | --- |
+| Rooms | Ephemeral in-memory rooms, creator tracking, join/leave/close, generated `FLUX-XXXX` codes, room-scoped presence, and cleanup when the last device leaves. |
+| Invite flow | `?room=FLUX-####` deep links, copyable invite links, QR-code sharing, join-by-code, room regeneration, and close-room controls. |
+| Browser transfer | Direct WebRTC DataChannel transfer with transfer approval, SDP, ICE candidates, cancellation, checksum verification, progress, and failure handling. |
+| Network policy | STUN-only direct-path verification with no TURN relay fallback. |
+| Chunking | Existing conservative DataChannel chunking and queue behavior remain untouched. |
+| Hosting | One Render Node service, the current static-client serving path, `/health`, `/healthz`, and the 10-minute self-ping remain in place. |
 
-## Important files
+## Telegram implementation
 
-`server/src/services/deviceManager.ts` contains the ephemeral room registry. `server/src/socket/socketHandler.ts` contains room-scoped presence and signaling handlers. `client/src/hooks/useSocket.ts` manages URL-aware room membership. `client/src/services/webrtc.ts` contains STUN-only direct-path verification and DataChannel transfer. `client/src/context/AppContext.tsx` coordinates room state and transfer lifecycle. `client/src/components/RoomShareModal.tsx` contains link, QR, regeneration, close, and join controls.
+`server/src/telegram/telegramBridge.ts` contains the Telegram Bot API client, webhook handler, commands, inline keyboards, per-chat room sessions, Node WebRTC peer, compatible file-protocol handling, checksum verification, and Telegram photo/document delivery. The bridge connects to the local NearFlux Socket.IO endpoint using `socket.io-client`, so it reuses the existing room registry and signaling authorization instead of introducing a second room database or signaling server.
+
+The bot supports `/start`, `/newroom`, `/join FLUX-XXXX`, `/status`, and `/leave`. `/newroom` generates a compatible room and joins it through the existing `join-room` event. `/join` joins an existing browser-created room. `/status` reports bridge and web-peer presence. `/leave` emits the existing `leave-room` event, closes bridge WebRTC peers, and clears temporary in-memory transfer state.
+
+Telegram-originated files are downloaded temporarily, held in memory only for the active transfer, and sent through a compatible WebRTC data channel to the first connected web peer in the same room. The browser sees a normal NearFlux transfer request and must accept it. Browser-originated files targeted at the Telegram Bridge are accepted automatically by the bridge, received through the existing `FILE_START` / `FILE_CHUNK` / `FILE_END` protocol, checksum-verified, and sent back to the Telegram chat using `sendPhoto` for images or `sendDocument` for other files.
+
+## Mini App behavior
+
+No second frontend was created. The bot's `Open Mini App` button points to `TELEGRAM_WEBAPP_URL`, with the active room encoded as `?room=FLUX-XXXX`. The current `useSocket` hook already parses that parameter, auto-joins on connection, and keeps the canonical room URL synchronized. Therefore Chrome, Firefox, mobile browsers, the Telegram WebView, and the server-side bridge can participate in the same room.
+
+## Files changed and added
+
+| File | Change |
+| --- | --- |
+| `server/src/telegram/telegramBridge.ts` | Added Telegram Bot API client, webhook, commands, inline keyboards, room sessions, Node WebRTC peer, transfer protocol, checksum verification, and Telegram delivery. |
+| `server/src/index.ts` | Added JSON webhook parsing and bridge registration while preserving existing HTTP, Socket.IO, health, and keep-alive setup. |
+| `server/package.json` and `server/package-lock.json` | Added `socket.io-client`, `wrtc`, and the native dependency helper required by `wrtc`. |
+| `server/src/types/wrtc.d.ts` | Added a local TypeScript declaration for `wrtc`. |
+| `render.yaml` | Added Telegram environment variables and a default 20 MiB bridge limit. |
+| `.node-version` and root `package.json` | Pinned Render to Node 20 for native WebRTC runtime compatibility. |
+| `.env.example` | Added a credential-free configuration template. |
+| `TELEGRAM_SETUP.md` | Added BotFather, Render, webhook, testing, architecture, and limitation documentation. |
+| `README.md` | Added a link to the Telegram documentation. |
+| `research/socket-room-smoke.mjs` | Added a two-client room/presence smoke test. |
+| `research/telegram-integration-baseline.md` | Recorded the inspected architecture and API findings. |
+
+## Configuration required
+
+Set these in Render as service environment variables:
+
+| Variable | Required | Value |
+| --- | --- | --- |
+| `TELEGRAM_BOT_TOKEN` | Yes to enable Telegram | The secret token issued by BotFather. |
+| `TELEGRAM_WEBAPP_URL` | Recommended | `https://nearflux-p2p-share.onrender.com/`. |
+| `TELEGRAM_WEBHOOK_SECRET` | Recommended | A random secret for webhook verification. |
+| `TELEGRAM_MAX_FILE_BYTES` | Optional | Defaults to `20971520` bytes (20 MiB). |
+| `RENDER_EXTERNAL_URL` | Existing | `https://nearflux-p2p-share.onrender.com`. |
+
+The bot token is never exposed through frontend variables and is not present in the repository. When a token is configured, startup registers commands and attempts to register the HTTPS webhook at `/telegram/webhook`.
+
+## BotFather and Render steps
+
+Create or select the bot in [@BotFather](https://t.me/BotFather), copy its token into Render as `TELEGRAM_BOT_TOKEN`, configure the Mini App/menu button to use `TELEGRAM_WEBAPP_URL`, and keep that URL on HTTPS. Render should deploy the `main` branch using the checked-in `render.yaml`. After the token and webhook secret are added, restart or redeploy the service and verify the server logs contain `[telegram] bot configured` without any token or file contents.
+
+Telegram's official Bot API supports HTTPS webhooks and file send/download methods, and its official Mini App documentation supports launching a JavaScript web app inside Telegram.[1] [2]
 
 ## Verification performed
 
-Both production builds passed with `npm run build:server` and `npm run build:client`. The signaling server integration test passed for same-room presence isolation, different-room isolation, and correct SDP answer routing from the receiver back to the original offer sender. A deployed-transfer fix also adds a direct-connection timeout so a failed handshake cannot remain stuck indefinitely. The health endpoint reported `fileDataRelay: false`. A final source audit found no TURN configuration, no file-chunk event, no Socket.IO file-transfer method, no forced fallback path, and no HTTP upload/download path. Browser checks passed for onboarding, QR rendering, room regeneration, URL updates, join-by-code, and console cleanliness.
+The server TypeScript build passed. The existing client TypeScript and Vite production build passed. A local compiled-server smoke test returned successful JSON responses from both `/health` and `/healthz` and served the built frontend. A two-client Socket.IO smoke test joined two clients to `FLUX-ABCD` and confirmed room state and `device-joined` presence behavior.
 
-## Deployment
+The changes were committed and pushed to `vishwakarma47/nearflux-p2p-share` on `main`:
 
-Install with `npm run install:all`. Build with `npm run build:client && npm run build:server`. Start with `node server/dist/index.js`. Set `PORT` for the server and optionally set `FRONTEND_ORIGIN` to the deployed HTTPS frontend origin. For a separately hosted frontend, set `VITE_SIGNALING_URL` at client build time to the public signaling-server origin.
+| Commit | Description |
+| --- | --- |
+| `40af3cc` | Add Telegram bot WebRTC bridge and Mini App setup. |
+| `3bd3fdc` | Pin Render runtime for WebRTC bridge. |
 
-## Guest-mode history and workspace navigation
+Render accepted the first commit and began an auto-deploy. The public service still reported the previous commit while the build was in progress. The subsequent Node 20 pin was pushed to reduce the risk of the native `wrtc` package being built under Render's default Node 24 runtime. Telegram end-to-end testing remains blocked until a real BotFather token is configured in Render.
 
-The client now supports guest use without authentication. Ended transfer metadata is retained locally in the browser under `NearFlux_transfer_history`, bounded to a small recent-history list and clearable from the Transfers view. File contents and `File` objects are never persisted, and no server account or synchronization claim is made. The icon rail now switches real Home, Transfers, Devices, Rooms, and Settings views. The latest CSS pass adds translucent theme-aware surfaces, smooth light/dark interpolation, overflow containment, long-label ellipsis, safe wrapping, and responsive grid collapse.
+## Exact test procedure after token setup
 
-This pass was UI/state-only and did not change the signaling, ICE, WebRTC DataChannel, or direct-P2P enforcement paths.
+First verify browser-to-browser transfer with two ordinary browsers. Then send `/start` to the bot, run `/newroom`, open the Mini App button, and confirm the existing app opens with the room query parameter. Join the same room from a normal browser and check `/status`. Send a small document or photo to the bot, accept the NearFlux transfer request in the browser, and verify that it arrives through the existing transfer UI. Next, select `NearFlux Telegram Bridge` as the browser transfer target and verify that Telegram receives a photo preview or document. Repeat near the configured size limit, test an oversized file error, exercise `/join`, `/status`, `/leave`, browser disconnect/reconnect, and room expiration, and confirm both health endpoints remain successful.
 
-## Limitation
+## Limitations
 
-Strict direct P2P cannot succeed on every NAT or firewall combination. The app intentionally fails safely when no allowed direct `host` or `srflx` path can be verified. A two-browser cross-network test must be run with real devices and a public HTTPS signaling deployment; this sandbox verification covered room signaling, UI behavior, builds, source audit, and local server integration.
+The bridge defaults to 20 MiB because Telegram Bot API file download and upload limits apply; method-specific limits may vary.[1] The bridge currently chooses the first connected web peer for Telegram-originated transfers. The existing no-TURN direct-path policy remains in effect, so WebRTC connectivity has the same NAT and firewall constraints as browser-to-browser transfers. Render's free service may cold-start, which can delay webhook processing. No claim is made that Telegram end-to-end transfer has been tested until a real bot token and connected Telegram chat are available.
+
+## References
+
+[1]: https://core.telegram.org/bots/api "Telegram Bot API"
+[2]: https://core.telegram.org/bots/webapps "Telegram Mini Apps"

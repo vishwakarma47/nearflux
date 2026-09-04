@@ -6,6 +6,14 @@ The existing NearFlux application was inspected first and extended in place. The
 
 The implementation adds an optional server-side Telegram Bot and WebRTC bridge. When `TELEGRAM_BOT_TOKEN` is not set, the integration is disabled and the existing application continues to run without Telegram code paths being activated. When enabled, the bot joins the same ephemeral room system as a named `NearFlux Telegram Bridge` device and uses the same Socket.IO room and signaling events as browser clients.
 
+## Latest Telegram transfer fix
+
+The screenshots exposed a concrete Node WebRTC interoperability bug. The bridge forwarded `event.candidate.toJSON()` from the native `wrtc` package, but native Node ICE candidate objects in this runtime do not implement the browser-only `toJSON()` method. The exception prevented bridge ICE candidates from reaching the browser, leaving both directions stuck at “Establishing a direct WebRTC connection…”.
+
+The bridge now serializes native candidates explicitly (`candidate`, `sdpMid`, `sdpMLineIndex`, and `usernameFragment` when available). It also now performs the same symmetric direct-readiness handshake as the browser before either sending file bytes or accepting them: each side verifies a selected non-relay candidate pair, emits `DIRECT_READY`, waits for the peer's `DIRECT_READY`, and only then proceeds with the transfer. Per-peer readiness state is cleared on close or leave.
+
+A focused native WebRTC smoke test established a data channel with `connectionState: connected`, `iceConnectionState: completed`, and a succeeded nominated candidate pair. The process emitted a native-library segmentation fault during teardown after printing the successful assertion; this did not affect the connection assertion, but the test process should be treated as an external validation helper rather than a production runtime path.
+
 ## Existing architecture preserved
 
 | Area | Existing behavior retained |
@@ -43,6 +51,7 @@ No second frontend was created. The bot's `Open Mini App` button points to `TELE
 | `TELEGRAM_SETUP.md` | Added BotFather, Render, webhook, testing, architecture, and limitation documentation. |
 | `README.md` | Added a link to the Telegram documentation. |
 | `research/socket-room-smoke.mjs` | Added a two-client room/presence smoke test. |
+| `research/wrtc-handshake-smoke.mjs` | Added a focused native Node WebRTC candidate-pair smoke test. |
 | `research/telegram-integration-baseline.md` | Recorded the inspected architecture and API findings. |
 
 ## Configuration required

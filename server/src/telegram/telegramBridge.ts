@@ -114,6 +114,15 @@ function checksumUpdate(checksum: number, bytes: Uint8Array): number {
 }
 
 function checksumString(value: number): string { return (value >>> 0).toString(16).padStart(8, '0'); }
+function serializeIceCandidate(candidate: any): any {
+  if (typeof candidate?.toJSON === 'function') return candidate.toJSON();
+  return {
+    candidate: candidate?.candidate,
+    sdpMid: candidate?.sdpMid ?? null,
+    sdpMLineIndex: candidate?.sdpMLineIndex ?? null,
+    ...(candidate?.usernameFragment ? { usernameFragment: candidate.usernameFragment } : {}),
+  };
+}
 function normalizeRoomCode(value: string): string { return value.trim().toUpperCase().replace(/[^A-Z0-9-]/g, '').slice(0, 9); }
 function webAppUrl(base: string, room?: string): string { return `${base.replace(/\/$/, '')}/${room ? `?room=${encodeURIComponent(room)}` : ''}`; }
 
@@ -126,6 +135,9 @@ class BridgeSession {
   private pendingOutbound: { bytes: Buffer; name: string; type: string; targetId: string } | null = null;
   private receiveFiles = new Map<string, ReceiveState>();
   private pendingCandidates = new Map<string, any[]>();
+  private directReady = new Set<string>();
+  private remoteReady = new Set<string>();
+  private remoteReadyWaiters = new Map<string, Array<() => void>>();
 
   constructor(
     private readonly chatId: number,
@@ -236,7 +248,7 @@ class BridgeSession {
 
   private createPeer(remoteId: string, initiator: boolean): any {
     const peer = new RTCPeerConnection({ iceServers: [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun.cloudflare.com:3478'] }], iceCandidatePoolSize: 4 });
-    peer.onicecandidate = (event: any) => { if (event.candidate && this.currentDevice) this.socket.emit('webrtc-ice-candidate', { roomCode: this.roomCode, senderId: this.currentDevice.id, targetId: remoteId, signal: event.candidate.toJSON() }); };
+    peer.onicecandidate = (event: any) => { if (event.candidate && this.currentDevice) this.socket.emit('webrtc-ice-candidate', { roomCode: this.roomCode, senderId: this.currentDevice.id, targetId: remoteId, signal: serializeIceCandidate(event.candidate) }); };
     peer.onconnectionstatechange = () => { if (['failed', 'closed'].includes(peer.connectionState)) this.closePeer(remoteId); };
     return peer;
   }
@@ -244,14 +256,73 @@ class BridgeSession {
   private setupChannel(channel: any, remoteId: string, sender: boolean, outbound?: { bytes: Buffer; name: string; type: string }): void {
     channel.binaryType = 'arraybuffer';
     channel.onopen = () => {
-      channel.send(JSON.stringify({ type: 'DIRECT_READY' }));
-      if (sender) {
-        if (outbound) void this.transmit(channel, outbound);
-      }
+      void this.establishDirectReady(channel, remoteId, sender, outbound).catch(async (error) => {
+        await this.onStatus(`❌ ${error instanceof Error ? error.message : 'Direct WebRTC readiness failed.'}`);
+        this.closePeer(remoteId);
+      });
     };
     channel.onmessage = (event: any) => void this.handleMessage(channel, remoteId, event.data);
     channel.onerror = () => void this.onStatus('❌ The direct WebRTC data channel failed.');
     channel.onclose = () => this.closePeer(remoteId);
+  }
+
+  private async establishDirectReady(channel: any, remoteId: string, sender: boolean, outbound?: { bytes: Buffer; name: string; type: string }): Promise<void> {
+    const type = await this.waitForDirectCandidateType(this.peers.get(remoteId));
+    if (type === 'relay' || type === 'unknown') {
+      await this.onStatus('❌ No allowed direct WebRTC path was verified.');
+      this.closePeer(remoteId);
+      return;
+    }
+    this.directReady.add(remoteId);
+    channel.send(JSON.stringify({ type: 'DIRECT_READY' }));
+    await this.waitForRemoteReady(remoteId);
+    if (sender && outbound && this.peers.has(remoteId)) await this.transmit(channel, outbound);
+  }
+
+  private async waitForRemoteReady(remoteId: string): Promise<void> {
+    if (this.remoteReady.has(remoteId)) return;
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('WebRTC readiness confirmation timed out.')), 15_000);
+      const waiters = this.remoteReadyWaiters.get(remoteId) || [];
+      waiters.push(() => { clearTimeout(timer); resolve(); });
+      this.remoteReadyWaiters.set(remoteId, waiters);
+    });
+  }
+
+  private async waitForDirectCandidateType(peer: any): Promise<'host' | 'srflx' | 'prflx' | 'relay' | 'unknown'> {
+    if (!peer) return 'unknown';
+    for (let attempt = 0; attempt < 150; attempt += 1) {
+      const type = await this.selectedCandidateType(peer);
+      if (type !== 'unknown') return type;
+      if (['failed', 'closed'].includes(peer.connectionState) || ['failed', 'closed'].includes(peer.iceConnectionState)) return 'unknown';
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    return 'unknown';
+  }
+
+  private async selectedCandidateType(peer: any): Promise<'host' | 'srflx' | 'prflx' | 'relay' | 'unknown'> {
+    try {
+      const stats = await peer.getStats();
+      const pairs = new Map<string, any>();
+      const candidates = new Map<string, any>();
+      let selectedId: string | undefined;
+      stats.forEach((entry: any) => {
+        if (entry.type === 'transport' && typeof entry.selectedCandidatePairId === 'string') selectedId = entry.selectedCandidatePairId;
+        if (entry.type === 'candidate-pair') pairs.set(entry.id, entry);
+        if (entry.type === 'local-candidate' || entry.type === 'remote-candidate') candidates.set(entry.id, entry);
+      });
+      let pair = selectedId ? pairs.get(selectedId) : undefined;
+      if (!pair) pair = [...pairs.values()].find((candidatePair: any) => candidatePair.state === 'succeeded' && (candidatePair.selected || candidatePair.nominated));
+      if (!pair && peer.connectionState === 'connected') pair = [...pairs.values()].find((candidatePair: any) => candidatePair.state === 'succeeded');
+      if (!pair) return 'unknown';
+      const types = [candidates.get(pair.localCandidateId)?.candidateType, candidates.get(pair.remoteCandidateId)?.candidateType].filter(Boolean);
+      if (types.includes('relay')) return 'relay';
+      if (types.every((value) => value === 'host')) return 'host';
+      if (types.includes('srflx')) return 'srflx';
+      if (types.includes('prflx')) return 'prflx';
+      if (types.includes('host')) return 'host';
+    } catch { /* stats may be unavailable during ICE startup */ }
+    return 'unknown';
   }
 
   private async transmit(channel: any, item: { bytes: Buffer; name: string; type: string }): Promise<void> {
@@ -282,7 +353,14 @@ class BridgeSession {
       return;
     }
     let message: any; try { message = JSON.parse(raw); } catch { return; }
-    if (message.type === 'DIRECT_READY') { channel.send(JSON.stringify({ type: 'DIRECT_READY_ACK' })); return; }
+    if (message.type === 'DIRECT_READY') {
+      this.remoteReady.add(remoteId);
+      const waiters = this.remoteReadyWaiters.get(remoteId) || [];
+      this.remoteReadyWaiters.delete(remoteId);
+      waiters.forEach((resolve) => resolve());
+      channel.send(JSON.stringify({ type: 'DIRECT_READY_ACK' }));
+      return;
+    }
     if (message.type === 'DIRECT_READY_ACK') return;
     if (message.type === 'FILE_START') {
       this.receiveFiles.set(message.fileId, { fileId: message.fileId, fileName: message.fileName, fileSize: message.fileSize, fileType: message.fileType, chunks: [], receivedBytes: 0, expectedChunkIndex: 0, pendingChunk: null, checksum: FNV_OFFSET_BASIS });
@@ -299,7 +377,15 @@ class BridgeSession {
     }
   }
 
-  private closePeer(remoteId: string): void { const peer = this.peers.get(remoteId); this.peers.delete(remoteId); this.pendingCandidates.delete(remoteId); try { peer?.close(); } catch {} }
+  private closePeer(remoteId: string): void {
+    const peer = this.peers.get(remoteId);
+    this.peers.delete(remoteId);
+    this.pendingCandidates.delete(remoteId);
+    this.directReady.delete(remoteId);
+    this.remoteReady.delete(remoteId);
+    this.remoteReadyWaiters.delete(remoteId);
+    try { peer?.close(); } catch {}
+  }
   leave(): void { if (this.roomCode && this.socket.connected) this.socket.emit('leave-room', { roomCode: this.roomCode }); for (const id of this.peers.keys()) this.closePeer(id); this.roomCode = ''; this.currentDevice = null; this.devices = []; }
 }
 

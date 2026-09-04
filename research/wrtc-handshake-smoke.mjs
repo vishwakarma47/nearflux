@@ -1,0 +1,31 @@
+import wrtc from '../server/node_modules/wrtc/lib/index.js';
+
+const { RTCPeerConnection, RTCSessionDescription, RTCIceCandidate } = wrtc;
+const a = new RTCPeerConnection({ iceServers: [] });
+const b = new RTCPeerConnection({ iceServers: [] });
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const candidates = [];
+const candidateInit = (candidate) => ({ candidate: candidate.candidate, sdpMid: candidate.sdpMid ?? null, sdpMLineIndex: candidate.sdpMLineIndex ?? null });
+a.onicecandidate = ({ candidate }) => { if (candidate) b.addIceCandidate(new RTCIceCandidate(candidateInit(candidate))).catch(() => undefined); };
+b.onicecandidate = ({ candidate }) => { if (candidate) a.addIceCandidate(new RTCIceCandidate(candidateInit(candidate))).catch(() => undefined); };
+const opened = new Promise((resolve, reject) => {
+  const timer = setTimeout(() => reject(new Error('data channel timeout')), 10000);
+  b.ondatachannel = ({ channel }) => { channel.onopen = () => { clearTimeout(timer); resolve(channel); }; };
+});
+const channel = a.createDataChannel('fileTransfer', { ordered: true });
+const offer = await a.createOffer();
+await a.setLocalDescription(offer);
+await b.setRemoteDescription(new RTCSessionDescription(offer));
+const answer = await b.createAnswer();
+await b.setLocalDescription(answer);
+await a.setRemoteDescription(new RTCSessionDescription(answer));
+await opened;
+await wait(250);
+const stats = await a.getStats();
+const entries = [];
+stats.forEach((entry) => { if (['transport', 'candidate-pair', 'local-candidate', 'remote-candidate'].includes(entry.type)) entries.push(entry); });
+const pair = entries.find((entry) => entry.type === 'candidate-pair' && (entry.selected || entry.nominated || entry.state === 'succeeded'));
+if (!pair) throw new Error(`No selected/succeeded candidate pair; states: ${entries.filter((entry) => entry.type === 'candidate-pair').map((entry) => `${entry.state}/${entry.selected}/${entry.nominated}`).join(',')}`);
+console.log(JSON.stringify({ ok: true, channel: channel.readyState, connectionState: a.connectionState, iceState: a.iceConnectionState, selectedPair: { state: pair.state, selected: pair.selected, nominated: pair.nominated }, statsTypes: entries.map((entry) => entry.type) }));
+a.close();
+b.close();

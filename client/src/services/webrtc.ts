@@ -1,4 +1,4 @@
-import type { TransferState } from '../types/index.js';
+import type { ReceivedText, TransferState } from '../types/index.js';
 import { socketService } from './socket.js';
 
 /**
@@ -216,6 +216,10 @@ export interface TransferProgressCallback {
   (state: Partial<TransferState>): void;
 }
 
+export interface TextReceivedCallback {
+  (payload: Omit<ReceivedText, 'peerDeviceName'>): void;
+}
+
 function createDeferred(): Deferred {
   let resolve!: () => void;
   let reject!: (error: Error) => void;
@@ -265,6 +269,7 @@ export class WebRTCService {
   private lastSpeed = 0;
 
   private onProgressCallback: TransferProgressCallback | null = null;
+  private onTextReceivedCallback: TextReceivedCallback | null = null;
   private onChannelOpenCallback: (() => void) | null = null;
 
   private channelOpened = false;
@@ -309,6 +314,10 @@ export class WebRTCService {
 
   public setProgressCallback(callback: TransferProgressCallback): void {
     this.onProgressCallback = callback;
+  }
+
+  public onTextReceived(callback: TextReceivedCallback): void {
+    this.onTextReceivedCallback = callback;
   }
 
   public onChannelOpen(callback: () => void): void {
@@ -1392,7 +1401,7 @@ export class WebRTCService {
       }
 
       case 'FILE_END': {
-        this.finishReceivedFile(parsed);
+        void this.finishReceivedFile(parsed);
         break;
       }
 
@@ -1411,7 +1420,7 @@ export class WebRTCService {
     }
   }
 
-  private finishReceivedFile(message: FileEndMessage): void {
+  private async finishReceivedFile(message: FileEndMessage): Promise<void> {
     const current = this.currentFile;
 
     if (!current || current.fileId !== message.fileId) {
@@ -1461,11 +1470,19 @@ export class WebRTCService {
       return;
     }
 
-    this.downloadFile(
-      current.chunks,
-      current.relativePath || current.fileName,
-      current.fileType
-    );
+    const receivedName = current.relativePath || current.fileName;
+    const isTextSnippet = current.fileName.startsWith('text-snippet-') && current.fileType === 'text/plain';
+    if (isTextSnippet) {
+      const text = await new Blob(current.chunks, { type: current.fileType }).text();
+      this.onTextReceivedCallback?.({
+        text,
+        fileName: receivedName,
+        fileSize: current.fileSize,
+        receivedAt: new Date().toISOString(),
+      });
+    } else {
+      this.downloadFile(current.chunks, receivedName, current.fileType);
+    }
 
     this.currentFile = null;
 

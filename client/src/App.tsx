@@ -4,7 +4,7 @@ import { useApp } from './context/AppContext';
 import { AppProvider } from './context/AppContext';
 import { Header } from './components/Header';
 import { Sidebar, WorkspaceView } from './components/Sidebar';
-import { FileDropzone } from './components/FileDropzone';
+import { TransferComposer } from './components/TransferComposer';
 import { FileList } from './components/FileList';
 import { DeviceList } from './components/DeviceList';
 import { DeviceOnboardingModal } from './components/DeviceOnboardingModal';
@@ -15,6 +15,7 @@ import { RoomInvitePanel } from './components/RoomInvitePanel';
 import { TransferWorkspacePanel } from './components/TransferWorkspacePanel';
 import { TransferHistoryPanel } from './components/TransferHistoryPanel';
 import { SettingsPanel } from './components/SettingsPanel';
+import { ReceivedTextModal } from './components/ReceivedTextModal';
 import { MobileBottomNav } from './components/MobileBottomNav';
 
 const footerContent: Record<string, { title: string; body: string }> = {
@@ -50,12 +51,12 @@ const MainContent: React.FC = () => {
   return <div className="app-container workspace-shell"><a className="skip-link" href="#main-content">Skip to main content</a><Header /><div className="workspace-layout"><Sidebar activeView={activeView} onNavigate={navigate} /><main id="main-content" className="main-content workspace-main" tabIndex={-1}>
     {serverState === 'slow' && <div className="server-state-banner server-state-slow" role="status" aria-live="polite"><LoaderCircle size={16} className="spin" aria-hidden="true" /><span><strong>Waking server up...</strong><small>Render may take around 30 seconds on a cold start.</small></span></div>}
     {serverState === 'offline' && <div className="server-state-banner server-state-offline" role="alert"><WifiOff size={16} aria-hidden="true" /><span><strong>Server unreachable</strong><small>Tap retry to reconnect to your private room.</small></span><button className="btn compact-btn" type="button" onClick={() => window.location.reload()}><RefreshCw size={14} aria-hidden="true" /> Retry</button></div>}
-    {activeView === 'home' && <><div className="workspace-hero-grid"><FileDropzone /><RoomInvitePanel onOpenShare={roomOpen} /></div><div className="workspace-lower-grid"><DeviceList /><FileList /><TransferWorkspacePanel /></div></>}
+    {activeView === 'home' && <><div className="workspace-hero-grid"><TransferComposer /><RoomInvitePanel onOpenShare={roomOpen} /></div><div className="workspace-lower-grid"><DeviceList /><FileList /><TransferWorkspacePanel /></div></>}
     {activeView === 'transfers' && <div className="view-shell"><ViewHeader view="transfers" /><div className="view-two-column"><TransferHistoryPanel /><TransferWorkspacePanel /></div></div>}
     {activeView === 'devices' && <div className="view-shell"><ViewHeader view="devices" /><DeviceList /></div>}
     {activeView === 'rooms' && <div className="view-shell"><ViewHeader view="rooms" /><div className="rooms-view-grid"><RoomInvitePanel onOpenShare={roomOpen} /><div className="workspace-card room-guide-card"><span className="section-kicker">ROOM ACCESS</span><h2>Share a private room</h2><p>Invite a friend with the room link or QR code. Files stay on the direct peer connection once both devices are verified.</p><button className="btn primary" type="button" onClick={roomOpen}>Open room controls</button></div></div></div>}
     {activeView === 'settings' && <div className="view-shell"><ViewHeader view="settings" /><SettingsPanel /></div>}
-  </main></div><MobileBottomNav activeView={activeView} onNavigate={navigate} /><TransferRequestModal /><TransferProgress /><DeviceOnboardingModal /><RoomShareModal isOpen={isWorkspaceRoomOpen} onClose={() => setIsWorkspaceRoomOpen(false)} /><footer id="app-footer" className="app-footer"><div className="footer-links" aria-label="Footer navigation">{Object.keys(footerContent).map((label) => <button key={label} type="button" onClick={() => setInfoKey(label)}>{label}</button>)}<button type="button" className="support-link" onClick={() => setInfoKey('About')}>Support Developer</button></div><span>© 2026 <strong>NearFlux Online</strong> · Fast, Private Worldwide P2P Transfers</span></footer>{info && <div className="modal-backdrop" onClick={() => setInfoKey(null)}><div className="modal-card info-modal" role="dialog" aria-modal="true" aria-labelledby="info-modal-title" onClick={(event) => event.stopPropagation()}><div className="modal-header"><div className="modal-title-group"><div className="modal-icon-bg">i</div><div><h3 id="info-modal-title">{info.title}</h3></div></div><button className="icon-btn close-btn" type="button" aria-label="Close information dialog" onClick={() => setInfoKey(null)}>×</button></div><p>{info.body}</p><button className="btn primary" type="button" onClick={() => setInfoKey(null)}>Close</button></div></div>}</div>;
+  </main></div><MobileBottomNav activeView={activeView} onNavigate={navigate} /><TransferRequestModal /><TransferProgress /><ReceivedTextModal /><DeviceOnboardingModal /><RoomShareModal isOpen={isWorkspaceRoomOpen} onClose={() => setIsWorkspaceRoomOpen(false)} /><footer id="app-footer" className="app-footer"><div className="footer-links" aria-label="Footer navigation">{Object.keys(footerContent).map((label) => <button key={label} type="button" onClick={() => setInfoKey(label)}>{label}</button>)}<button type="button" className="support-link" onClick={() => setInfoKey('About')}>Support Developer</button></div><span>© 2026 <strong>NearFlux Online</strong> · Fast, Private Worldwide P2P Transfers</span></footer>{info && <div className="modal-backdrop" onClick={() => setInfoKey(null)}><div className="modal-card info-modal" role="dialog" aria-modal="true" aria-labelledby="info-modal-title" onClick={(event) => event.stopPropagation()}><div className="modal-header"><div className="modal-title-group"><div className="modal-icon-bg">i</div><div><h3 id="info-modal-title">{info.title}</h3></div></div><button className="icon-btn close-btn" type="button" aria-label="Close information dialog" onClick={() => setInfoKey(null)}>×</button></div><p>{info.body}</p><button className="btn primary" type="button" onClick={() => setInfoKey(null)}>Close</button></div></div>}</div>;
 };
 
 export const App: React.FC = () => <AppProvider><MainContent /></AppProvider>;

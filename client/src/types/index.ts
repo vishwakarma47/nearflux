@@ -40,6 +40,14 @@ export interface TransferState {
   serverRole?: 'signaling-only';
 }
 
+export interface ReceivedText {
+  text: string;
+  fileName: string;
+  fileSize: number;
+  peerDeviceName?: string;
+  receivedAt: string;
+}
+
 export interface TransferHistoryItem {
   id: string;
   direction: 'sent' | 'received';

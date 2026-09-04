@@ -4,6 +4,7 @@ import {
   SelectedFile,
   TransferState,
   TransferHistoryItem,
+  ReceivedText,
   TransferRequestPayload,
   TransferResponsePayload,
   WebRTCSignalPayload,
@@ -47,6 +48,8 @@ interface AppContextType {
   closeTransfer: () => void;
   transferHistory: TransferHistoryItem[];
   clearTransferHistory: () => void;
+  receivedText: ReceivedText | null;
+  clearReceivedText: () => void;
 }
 
 const initialTransferState: TransferState = {
@@ -83,6 +86,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [selectedTargetDevices, setSelectedTargetDevices] = useState<Device[]>([]);
   const [transferState, setTransferState] = useState<TransferState>(initialTransferState);
   const [incomingRequest, setIncomingRequest] = useState<TransferRequestPayload | null>(null);
+  const [receivedText, setReceivedText] = useState<ReceivedText | null>(null);
   const [transferHistory, setTransferHistory] = useState<TransferHistoryItem[]>(() => {
     try {
       const saved = localStorage.getItem('NearFlux_transfer_history');
@@ -181,6 +185,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       const webrtc = new WebRTCService(currentDevice.id, payload.senderId, false, roomCode);
       activeWebRTCInstances.current.set(payload.senderId, webrtc);
       webrtc.setProgressCallback((update) => setTransferState((previous) => ({ ...previous, ...update })));
+      webrtc.onTextReceived((payload) => setReceivedText(payload));
       webrtc.onChannelOpen(async () => {
         try {
           await webrtc.verifyDirectConnection();
@@ -313,6 +318,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   }, [transferState]);
 
   const clearTransferHistory = () => setTransferHistory([]);
+  const clearReceivedText = () => setReceivedText(null);
 
   const closeTransfer = () => {
     activeWebRTCInstances.current.forEach((instance) => instance.close());
@@ -363,6 +369,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       closeTransfer,
       transferHistory,
       clearTransferHistory,
+      receivedText,
+      clearReceivedText,
     }}>
       {children}
     </AppContext.Provider>

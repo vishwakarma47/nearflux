@@ -3,7 +3,8 @@ import type { Express, Request, Response } from 'express';
 import type { Device } from '../../../shared/types/device.js';
 import { generateRoomCode } from '../services/deviceManager.js';
 
-const wrtc = await import('wrtc');
+const wrtcModule = await import('wrtc');
+const wrtc = (wrtcModule as any).default ?? wrtcModule;
 const { RTCPeerConnection, RTCSessionDescription, RTCIceCandidate } = wrtc as any;
 
 const CHUNK_SIZE = 60 * 1024;

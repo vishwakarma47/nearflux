@@ -46,6 +46,10 @@ The server accepts room join/leave/close messages, device presence updates, tran
 
 Direct connectivity is not guaranteed on every firewall or NAT combination. That limitation is intentional: when direct P2P is unavailable, NearFlux fails safely instead of using TURN, a relay, an upload endpoint, temporary storage, or any other indirect path.
 
+## Telegram integration
+
+The optional Telegram Bot and Mini App integration is documented in [`TELEGRAM_SETUP.md`](./TELEGRAM_SETUP.md). It joins the existing ephemeral room and signaling system as a server-side WebRTC bridge; the original browser-to-browser path remains available and unchanged when Telegram is disabled.
+
 ## License
 
 This project is licensed under the MIT License.

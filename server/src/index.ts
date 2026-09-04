@@ -5,6 +5,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { Server } from 'socket.io';
 import { deviceManager } from './services/deviceManager.js';
+import { createTelegramBridge } from './telegram/telegramBridge.js';
 import { setupSocketHandlers } from './socket/socketHandler.js';
 import { ClientToServerEvents, ServerToClientEvents } from './types/index.js';
 
@@ -17,6 +18,7 @@ const app = express();
 const startTime = Date.now();
 
 app.disable('x-powered-by');
+app.use(express.json({ limit: '1mb' }));
 app.use(express.static(clientDistPath));
 
 app.get(['/health', '/healthz'], (_request: Request, response: Response) => {
@@ -42,6 +44,7 @@ const io = new Server<ClientToServerEvents, ServerToClientEvents>(server, {
 });
 
 setupSocketHandlers(io);
+createTelegramBridge(app, PORT);
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`NearFlux signaling server listening on port ${PORT}`);

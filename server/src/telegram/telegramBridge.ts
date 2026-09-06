@@ -1,6 +1,8 @@
+import { randomUUID } from 'node:crypto';
 import { io, Socket } from 'socket.io-client';
 import type { Express, Request, Response } from 'express';
 import type { Device } from '../../../shared/types/device.js';
+import type { TransferRequestPayload } from '../../../shared/types/socket.js';
 import { generateRoomCode } from '../services/deviceManager.js';
 
 const wrtcModule = await import('wrtc');
@@ -24,6 +26,9 @@ type TelegramMessage = {
 type TelegramUpdate = { update_id: number; message?: TelegramMessage; callback_query?: { id: string; data?: string; message?: TelegramMessage } };
 
 type FileDescriptor = { name: string; size: number; type: string };
+
+type ChunkAckWaiter = { resolve: () => void; reject: (error: Error) => void };
+type VerificationWaiter = { checksum: string; resolve: () => void; reject: (error: Error) => void };
 
 type ReceiveState = {
   fileId: string;
@@ -57,6 +62,10 @@ class TelegramApi {
 
   answerCallbackQuery(id: string): Promise<unknown> {
     return this.call('answerCallbackQuery', { callback_query_id: id });
+  }
+
+  editMessageReplyMarkup(chatId: number, messageId: number, replyMarkup: unknown): Promise<unknown> {
+    return this.call('editMessageReplyMarkup', { chat_id: chatId, message_id: messageId, reply_markup: replyMarkup });
   }
 
   sendDocument(chatId: number, bytes: Buffer, filename: string, mimeType: string, caption?: string): Promise<unknown> {
@@ -139,6 +148,8 @@ class BridgeSession {
   private directReady = new Set<string>();
   private remoteReady = new Set<string>();
   private remoteReadyWaiters = new Map<string, Array<() => void>>();
+  private pendingChunkAcks = new Map<string, ChunkAckWaiter>();
+  private pendingVerifications = new Map<string, VerificationWaiter>();
 
   constructor(
     private readonly chatId: number,
@@ -146,6 +157,7 @@ class BridgeSession {
     private readonly socketUrl: string,
     private readonly onStatus: (text: string) => Promise<void>,
     private readonly onReceived: (bytes: Buffer, name: string, type: string) => Promise<void>,
+    private readonly requestApproval: (payload: TransferRequestPayload) => Promise<boolean>,
   ) {
     this.socket = io(socketUrl, { transports: ['websocket'], reconnection: true, autoConnect: false });
     this.socket.on('connect', () => { if (this.roomCode) this.joinSocket(this.roomCode); });
@@ -159,9 +171,20 @@ class BridgeSession {
     this.socket.on('device-joined', (device: Device) => { if (!this.devices.some((item) => item.id === device.id)) this.devices.push(device); });
     this.socket.on('device-left', ({ id }) => { this.devices = this.devices.filter((device) => device.id !== id); this.closePeer(id); });
     this.socket.on('transfer-response', (payload) => { if (payload.accepted && this.pendingOutbound && payload.targetId === this.pendingOutbound.targetId) void this.startOutboundPeer(payload.targetId); });
-    this.socket.on('transfer-request', (payload) => {
+    this.socket.on('transfer-request', (payload: TransferRequestPayload) => {
       if (!this.currentDevice || payload.roomCode !== this.roomCode || payload.targetId !== this.currentDevice.id) return;
-      this.socket.emit('transfer-response', { roomCode: this.roomCode, senderId: payload.senderId, targetId: this.currentDevice.id, accepted: true });
+      void this.requestApproval(payload).then((accepted) => {
+        if (!this.currentDevice || payload.roomCode !== this.roomCode) return;
+        this.socket.emit('transfer-response', {
+          roomCode: this.roomCode,
+          senderId: payload.senderId,
+          targetId: this.currentDevice.id,
+          accepted,
+          ...(accepted ? {} : { reason: 'Telegram user declined the transfer.' }),
+        });
+      }).catch(async (error) => {
+        await this.onStatus(`❌ ${error instanceof Error ? error.message : 'Telegram approval failed.'}`);
+      });
     });
     this.socket.on('webrtc-offer', (payload) => { if (payload.roomCode === this.roomCode && payload.targetId === this.currentDevice?.id) void this.acceptOffer(payload.senderId, payload.signal); });
     this.socket.on('webrtc-answer', (payload) => { const peer = this.peers.get(payload.senderId); if (peer) void peer.setRemoteDescription(new RTCSessionDescription(payload.signal)); });
@@ -335,12 +358,44 @@ class BridgeSession {
     for (let offset = 0, index = 0; offset < item.bytes.length; offset += CHUNK_SIZE, index += 1) {
       const chunk = item.bytes.subarray(offset, Math.min(offset + CHUNK_SIZE, item.bytes.length));
       checksum = checksumUpdate(checksum, chunk);
+      const acknowledged = this.waitForChunkAck(fileId, index);
       channel.send(JSON.stringify({ type: 'FILE_CHUNK', fileId, chunkIndex: index, byteLength: chunk.byteLength }));
       channel.send(chunk);
-      await new Promise((resolve) => setTimeout(resolve, 0));
+      await acknowledged;
     }
-    channel.send(JSON.stringify({ type: 'FILE_END', fileId, checksum: checksumString(checksum) }));
+    const finalChecksum = checksumString(checksum);
+    const verified = this.waitForFileVerification(fileId, finalChecksum);
+    channel.send(JSON.stringify({ type: 'FILE_END', fileId, checksum: finalChecksum }));
+    await verified;
     await this.onStatus(`✅ ${item.name} sent through NearFlux.`);
+  }
+
+  private waitForChunkAck(fileId: string, chunkIndex: number): Promise<void> {
+    const key = `${fileId}:${chunkIndex}`;
+    return new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingChunkAcks.delete(key);
+        reject(new Error(`Timed out waiting for browser acknowledgement of chunk ${chunkIndex + 1}.`));
+      }, 30_000);
+      this.pendingChunkAcks.set(key, {
+        resolve: () => { clearTimeout(timer); this.pendingChunkAcks.delete(key); resolve(); },
+        reject: (error) => { clearTimeout(timer); this.pendingChunkAcks.delete(key); reject(error); },
+      });
+    });
+  }
+
+  private waitForFileVerification(fileId: string, checksum: string): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingVerifications.delete(fileId);
+        reject(new Error('Timed out waiting for browser file verification.'));
+      }, 30_000);
+      this.pendingVerifications.set(fileId, {
+        checksum,
+        resolve: () => { clearTimeout(timer); this.pendingVerifications.delete(fileId); resolve(); },
+        reject: (error) => { clearTimeout(timer); this.pendingVerifications.delete(fileId); reject(error); },
+      });
+    });
   }
 
   private async handleMessage(channel: any, remoteId: string, raw: string | ArrayBuffer): Promise<void> {
@@ -363,6 +418,24 @@ class BridgeSession {
       return;
     }
     if (message.type === 'DIRECT_READY_ACK') return;
+    if (message.type === 'FILE_CHUNK_ACK') {
+      const waiter = this.pendingChunkAcks.get(`${message.fileId}:${message.chunkIndex}`);
+      waiter?.resolve();
+      return;
+    }
+    if (message.type === 'FILE_VERIFIED') {
+      const waiter = this.pendingVerifications.get(message.fileId);
+      if (!waiter) return;
+      if (waiter.checksum === message.checksum) waiter.resolve();
+      else waiter.reject(new Error('Browser reported a different checksum for the transferred file.'));
+      return;
+    }
+    if (message.type === 'FILE_ERROR') {
+      const error = new Error(message.error || 'Browser reported a file-transfer error.');
+      for (const waiter of this.pendingChunkAcks.values()) waiter.reject(error);
+      for (const waiter of this.pendingVerifications.values()) waiter.reject(error);
+      return;
+    }
     if (message.type === 'FILE_START') {
       this.receiveFiles.set(message.fileId, { fileId: message.fileId, fileName: message.fileName, fileSize: message.fileSize, fileType: message.fileType, chunks: [], receivedBytes: 0, expectedChunkIndex: 0, pendingChunk: null, checksum: FNV_OFFSET_BASIS });
       return;
@@ -393,6 +466,7 @@ class BridgeSession {
 export class TelegramBridgeManager {
   private readonly api: TelegramApi;
   private readonly sessions = new Map<number, BridgeSession>();
+  private readonly pendingApprovals = new Map<string, { payload: TransferRequestPayload; resolve: (accepted: boolean) => void; timer: NodeJS.Timeout }>();
   private readonly maxFileBytes: number;
   private readonly webAppUrl: string;
 
@@ -421,17 +495,63 @@ export class TelegramBridgeManager {
       session = new BridgeSession(chatId, this.api, this.config.socketUrl, async (text) => { await this.api.sendMessage(chatId, text); }, async (bytes, name, type) => {
         const caption = `📁 File from NearFlux\n${name}\n${bytes.length} bytes`;
         if (type.startsWith('image/')) await this.api.sendPhoto(chatId, bytes, name, caption); else await this.api.sendDocument(chatId, bytes, name, type, caption);
-      });
+      }, async (payload) => this.requestApproval(chatId, payload));
       this.sessions.set(chatId, session);
     }
     return session;
+  }
+
+  private async requestApproval(chatId: number, payload: TransferRequestPayload): Promise<boolean> {
+    const token = randomUUID();
+    const fileSummary = payload.files.map((file) => `• ${file.name} (${Math.ceil(file.size / 1024)} KB)`).join('\n');
+    const decision = new Promise<boolean>((resolve) => {
+      const timer = setTimeout(() => {
+        this.pendingApprovals.delete(token);
+        resolve(false);
+        void this.api.sendMessage(chatId, `⌛ Transfer request from ${payload.senderName} expired.`);
+      }, 60_000);
+      this.pendingApprovals.set(token, { payload, resolve, timer });
+    });
+    try {
+      await this.api.sendMessage(chatId, `📥 Incoming NearFlux transfer request\n\nFrom: ${payload.senderName}\nRoom: ${payload.roomCode}\n${fileSummary}\n\nDo you want to receive these files?`, {
+        inline_keyboard: [[
+          { text: '✅ Accept', callback_data: `transfer:accept:${token}` },
+          { text: '❌ Decline', callback_data: `transfer:decline:${token}` },
+        ]],
+      });
+    } catch (error) {
+      const pending = this.pendingApprovals.get(token);
+      if (pending) { clearTimeout(pending.timer); this.pendingApprovals.delete(token); }
+      throw error;
+    }
+    return decision;
+  }
+
+  private async resolveApproval(chatId: number, messageId: number | undefined, token: string, accepted: boolean): Promise<void> {
+    const pending = this.pendingApprovals.get(token);
+    if (!pending) {
+      await this.api.sendMessage(chatId, '⌛ This transfer request has expired or was already handled.');
+      return;
+    }
+    clearTimeout(pending.timer);
+    this.pendingApprovals.delete(token);
+    if (messageId) await this.api.editMessageReplyMarkup(chatId, messageId, { inline_keyboard: [] }).catch(() => undefined);
+    await this.api.sendMessage(chatId, accepted ? '✅ Transfer accepted. Establishing the direct NearFlux connection…' : '❌ Transfer declined.');
+    pending.resolve(accepted);
   }
 
   private async handleUpdate(update: TelegramUpdate): Promise<void> {
     const callback = update.callback_query;
     const message = update.message || callback?.message;
     if (!message) return;
-    if (callback) { await this.api.answerCallbackQuery(callback.id).catch(() => undefined); if (callback.data === 'newroom') return this.command(message.chat.id, '/newroom'); if (callback.data === 'status') return this.command(message.chat.id, '/status'); if (callback.data === 'leave') return this.command(message.chat.id, '/leave'); }
+    if (callback) {
+      await this.api.answerCallbackQuery(callback.id).catch(() => undefined);
+      if (callback.data === 'newroom') return this.command(message.chat.id, '/newroom');
+      if (callback.data === 'status') return this.command(message.chat.id, '/status');
+      if (callback.data === 'leave') return this.command(message.chat.id, '/leave');
+      const approval = /^(?:transfer):(accept|decline):([a-f0-9-]+)$/.exec(callback.data || '');
+      if (approval) return this.resolveApproval(message.chat.id, callback.message?.message_id, approval[2], approval[1] === 'accept');
+    }
     if (message.document || message.video || message.photo) return this.handleFile(message);
     if (message.text) return this.command(message.chat.id, message.text);
   }

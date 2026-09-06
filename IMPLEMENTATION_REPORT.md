@@ -31,7 +31,7 @@ A focused native WebRTC smoke test established a data channel with `connectionSt
 
 The bot supports `/start`, `/newroom`, `/join FLUX-XXXX`, `/status`, and `/leave`. `/newroom` generates a compatible room and joins it through the existing `join-room` event. `/join` joins an existing browser-created room. `/status` reports bridge and web-peer presence. `/leave` emits the existing `leave-room` event, closes bridge WebRTC peers, and clears temporary in-memory transfer state.
 
-Telegram-originated files are downloaded temporarily, held in memory only for the active transfer, and sent through a compatible WebRTC data channel to the first connected web peer in the same room. The browser sees a normal NearFlux transfer request and must accept it. Browser-originated files targeted at the Telegram Bridge are accepted automatically by the bridge, received through the existing `FILE_START` / `FILE_CHUNK` / `FILE_END` protocol, checksum-verified, and sent back to the Telegram chat using `sendPhoto` for images or `sendDocument` for other files.
+Telegram-originated files are downloaded temporarily, held in memory only for the active transfer, and sent through a compatible WebRTC data channel to the first connected web peer in the same room. The browser sees a normal NearFlux transfer request and must accept it. Browser-originated files targeted at the Telegram Bridge now produce an explicit Telegram Accept/Decline prompt; the bridge sends the Socket.IO acceptance only after the Telegram user accepts. The bridge receives the existing `FILE_START` / `FILE_CHUNK` / `FILE_END` protocol, acknowledges each chunk, checksum-verifies the complete file, and sends it back to the Telegram chat using `sendPhoto` for images or `sendDocument` for other files.
 
 ## Mini App behavior
 
@@ -52,6 +52,7 @@ No second frontend was created. The bot's `Open Mini App` button points to `TELE
 | `README.md` | Added a link to the Telegram documentation. |
 | `research/socket-room-smoke.mjs` | Added a two-client room/presence smoke test. |
 | `research/wrtc-handshake-smoke.mjs` | Added a focused native Node WebRTC candidate-pair smoke test. |
+| `research/telegram-approval-smoke.mjs` | Added a focused Accept callback smoke test using a mocked Telegram API. |
 | `research/telegram-integration-baseline.md` | Recorded the inspected architecture and API findings. |
 
 ## Configuration required
@@ -76,7 +77,7 @@ Telegram's official Bot API supports HTTPS webhooks and file send/download metho
 
 ## Verification performed
 
-The server TypeScript build passed. The existing client TypeScript and Vite production build passed. A local compiled-server smoke test returned successful JSON responses from both `/health` and `/healthz` and served the built frontend. A two-client Socket.IO smoke test joined two clients to `FLUX-ABCD` and confirmed room state and `device-joined` presence behavior.
+The server TypeScript build passed. The existing client TypeScript and Vite production build passed. A local compiled-server smoke test returned successful JSON responses from both `/health` and `/healthz` and served the built frontend. A two-client Socket.IO smoke test joined two clients to `FLUX-ABCD` and confirmed room state and `device-joined` presence behavior. A focused Telegram approval smoke test confirmed that an inline Accept callback resolves the waiting transfer decision.
 
 The changes were committed and pushed to `vishwakarma47/nearflux-p2p-share` on `main`:
 

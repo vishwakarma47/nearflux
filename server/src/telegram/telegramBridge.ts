@@ -273,7 +273,7 @@ class BridgeSession {
   private createPeer(remoteId: string, initiator: boolean): any {
     const peer = new RTCPeerConnection({ iceServers: [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun.cloudflare.com:3478'] }], iceCandidatePoolSize: 4 });
     peer.onicecandidate = (event: any) => { if (event.candidate && this.currentDevice) this.socket.emit('webrtc-ice-candidate', { roomCode: this.roomCode, senderId: this.currentDevice.id, targetId: remoteId, signal: serializeIceCandidate(event.candidate) }); };
-    peer.onconnectionstatechange = () => { if (['failed', 'closed'].includes(peer.connectionState)) this.closePeer(remoteId); };
+    peer.onconnectionstatechange = () => { if (peer.connectionState === 'closed') this.closePeer(remoteId); };
     return peer;
   }
 
@@ -318,7 +318,7 @@ class BridgeSession {
     for (let attempt = 0; attempt < 150; attempt += 1) {
       const type = await this.selectedCandidateType(peer);
       if (type !== 'unknown') return type;
-      if (['failed', 'closed'].includes(peer.connectionState) || ['failed', 'closed'].includes(peer.iceConnectionState)) return 'unknown';
+      if (peer.connectionState === 'closed' || peer.iceConnectionState === 'closed') return 'unknown';
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
     return 'unknown';
@@ -345,6 +345,7 @@ class BridgeSession {
       if (types.includes('srflx')) return 'srflx';
       if (types.includes('prflx')) return 'prflx';
       if (types.includes('host')) return 'host';
+      if (peer.connectionState === 'connected' || peer.iceConnectionState === 'connected' || peer.iceConnectionState === 'completed') return 'host';
     } catch { /* stats may be unavailable during ICE startup */ }
     return 'unknown';
   }

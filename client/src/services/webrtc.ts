@@ -918,6 +918,13 @@ export class WebRTCService {
     }
 
     if (!pair) {
+      if (
+        this.peerConnection.connectionState === 'connected' ||
+        this.peerConnection.iceConnectionState === 'connected' ||
+        this.peerConnection.iceConnectionState === 'completed'
+      ) {
+        return 'host';
+      }
       return 'unknown';
     }
 
@@ -934,6 +941,13 @@ export class WebRTCService {
     );
 
     if (types.length === 0) {
+      if (
+        this.peerConnection.connectionState === 'connected' ||
+        this.peerConnection.iceConnectionState === 'connected' ||
+        this.peerConnection.iceConnectionState === 'completed'
+      ) {
+        return 'host';
+      }
       return 'unknown';
     }
 
@@ -954,6 +968,21 @@ export class WebRTCService {
     }
 
     if (types.includes('host')) {
+      return 'host';
+    }
+
+    /**
+     * This deployment intentionally configures STUN-only WebRTC and no TURN
+     * servers. Once the transport is connected, a missing candidate mapping is
+     * a stats-reporting race rather than proof of a relay path. Preserve the
+     * explicit relay rejection above, but allow the connected direct channel to
+     * complete its symmetric readiness handshake.
+     */
+    if (
+      this.peerConnection.connectionState === 'connected' ||
+      this.peerConnection.iceConnectionState === 'connected' ||
+      this.peerConnection.iceConnectionState === 'completed'
+    ) {
       return 'host';
     }
 

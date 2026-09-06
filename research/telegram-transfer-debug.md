@@ -14,3 +14,10 @@ Render deployment `dep-dad8665ckfvc7396ccv0` for `84f1574` was still Building at
 After commit `84f1574` became Live, Render logs showed the bridge received transfer activity but crashed in `BridgeSession.createPeer` with `TypeError: RTCPeerConnection is not a constructor`. The dynamic ESM import of the CommonJS `wrtc` package exposed its constructors under `default`, while the bridge destructured named exports directly.
 
 Commit `c594bbc` now unwraps `wrtcModule.default ?? wrtcModule` before destructuring `RTCPeerConnection`, `RTCSessionDescription`, and `RTCIceCandidate`. Local production builds and a runtime constructor import check passed. The redeploy for `c594bbc` was triggered; production verification is pending its Render deployment completion.
+
+
+## Latest screenshot and remaining failure
+
+The latest screenshot shows that Telegram approval now works, but the browser sender remains at 0% and reports: “Direct P2P connection interrupted — Candidate: unknown — The direct data channel closed before direct P2P verification completed.” The Telegram chat shows the request was accepted and the bridge reports “Establishing the direct NearFlux connection…”.
+
+This places the failure after approval and data-channel opening, during candidate-pair verification. The Node bridge previously closed immediately on `connectionState === failed`, while the browser has an ICE-restart recovery path. Both implementations could also return `unknown` during a short stats-reporting race even after the transport was connected. The patch now keeps the Node peer alive until closed, permits transient failed/checking states during the bounded candidate wait, and treats a connected STUN-only channel with temporarily unavailable candidate mapping as direct rather than unknown. The browser received matching connected-state fallbacks for the same stats race.

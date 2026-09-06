@@ -100,3 +100,10 @@ The bridge defaults to 20 MiB because Telegram Bot API file download and upload 
 
 [1]: https://core.telegram.org/bots/api "Telegram Bot API"
 [2]: https://core.telegram.org/bots/webapps "Telegram Mini Apps"
+
+
+## Candidate-verification timing fix
+
+The latest production screenshot showed the approval flow working but the data channel closing with `Candidate: unknown` before direct verification. The remaining defect was a timing race in candidate-pair statistics combined with the Node bridge closing peers immediately on a transient ICE `failed` state. The browser already has bounded ICE-restart recovery, so the bridge now keeps the peer alive until a true close and waits through transient candidate-stat availability. Both browser and bridge treat a connected STUN-only channel with temporarily missing candidate mapping as direct, while still rejecting an explicitly reported relay candidate.
+
+After this correction, the full server/client production build passed, the Telegram approval callback smoke test passed, `/health` passed, and the two-client Socket.IO room smoke test passed against a local compiled server.

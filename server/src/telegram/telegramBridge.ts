@@ -147,7 +147,7 @@ class BridgeSession {
   private pendingCandidates = new Map<string, any[]>();
   private directReady = new Set<string>();
   private remoteReady = new Set<string>();
-  private remoteReadyWaiters = new Map<string, Array<() => void>>();
+  private remoteReadyWaiters = new Map<string, Array<{ resolve: () => void; reject: (error: Error) => void }>>();
   private pendingChunkAcks = new Map<string, ChunkAckWaiter>();
   private pendingVerifications = new Map<string, VerificationWaiter>();
 
@@ -273,7 +273,9 @@ class BridgeSession {
   private createPeer(remoteId: string, initiator: boolean): any {
     const peer = new RTCPeerConnection({ iceServers: [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun.cloudflare.com:3478'] }], iceCandidatePoolSize: 4 });
     peer.onicecandidate = (event: any) => { if (event.candidate && this.currentDevice) this.socket.emit('webrtc-ice-candidate', { roomCode: this.roomCode, senderId: this.currentDevice.id, targetId: remoteId, signal: serializeIceCandidate(event.candidate) }); };
-    peer.onconnectionstatechange = () => { if (peer.connectionState === 'closed') this.closePeer(remoteId); };
+    peer.onconnectionstatechange = () => {
+      if (peer.connectionState === 'closed' || peer.connectionState === 'failed') this.closePeer(remoteId);
+    };
     return peer;
   }
 
@@ -305,23 +307,28 @@ class BridgeSession {
 
   private async waitForRemoteReady(remoteId: string): Promise<void> {
     if (this.remoteReady.has(remoteId)) return;
+
     await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error('WebRTC readiness confirmation timed out.')), 15_000);
       const waiters = this.remoteReadyWaiters.get(remoteId) || [];
-      waiters.push(() => { clearTimeout(timer); resolve(); });
+      waiters.push({ resolve, reject });
       this.remoteReadyWaiters.set(remoteId, waiters);
     });
   }
 
   private async waitForDirectCandidateType(peer: any): Promise<'host' | 'srflx' | 'prflx' | 'relay' | 'unknown'> {
     if (!peer) return 'unknown';
-    for (let attempt = 0; attempt < 150; attempt += 1) {
+
+    /**
+     * Native `wrtc` can open the DataChannel before candidate-pair stats are
+     * published. This is intentionally a state wait, not a clock deadline:
+     * direct transfers must not be torn down while ICE is still checking.
+     */
+    for (;;) {
       const type = await this.selectedCandidateType(peer);
       if (type !== 'unknown') return type;
-      if (peer.connectionState === 'closed' || peer.iceConnectionState === 'closed') return 'unknown';
+      if (peer.connectionState === 'closed' || peer.connectionState === 'failed' || peer.iceConnectionState === 'closed' || peer.iceConnectionState === 'failed') return 'unknown';
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
-    return 'unknown';
   }
 
   private async selectedCandidateType(peer: any): Promise<'host' | 'srflx' | 'prflx' | 'relay' | 'unknown'> {
@@ -338,7 +345,18 @@ class BridgeSession {
       let pair = selectedId ? pairs.get(selectedId) : undefined;
       if (!pair) pair = [...pairs.values()].find((candidatePair: any) => candidatePair.state === 'succeeded' && (candidatePair.selected || candidatePair.nominated));
       if (!pair && peer.connectionState === 'connected') pair = [...pairs.values()].find((candidatePair: any) => candidatePair.state === 'succeeded');
-      if (!pair) return 'unknown';
+      if (!pair) {
+        /**
+         * `wrtc` can report a connected SCTP/DataChannel transport before it
+         * publishes the selected candidate-pair record. This bridge config has
+         * STUN only and no TURN servers, so a connected transport at this point
+         * is an allowed direct path rather than proof of a relay.
+         */
+        if (peer.connectionState === 'connected' || peer.iceConnectionState === 'connected' || peer.iceConnectionState === 'completed') {
+          return 'host';
+        }
+        return 'unknown';
+      }
       const types = [candidates.get(pair.localCandidateId)?.candidateType, candidates.get(pair.remoteCandidateId)?.candidateType].filter(Boolean);
       if (types.includes('relay')) return 'relay';
       if (types.every((value) => value === 'host')) return 'host';
@@ -374,27 +392,21 @@ class BridgeSession {
   private waitForChunkAck(fileId: string, chunkIndex: number): Promise<void> {
     const key = `${fileId}:${chunkIndex}`;
     return new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pendingChunkAcks.delete(key);
-        reject(new Error(`Timed out waiting for browser acknowledgement of chunk ${chunkIndex + 1}.`));
-      }, 30_000);
+      /** No elapsed-time deadline: peer closure and FILE_ERROR are terminal. */
       this.pendingChunkAcks.set(key, {
-        resolve: () => { clearTimeout(timer); this.pendingChunkAcks.delete(key); resolve(); },
-        reject: (error) => { clearTimeout(timer); this.pendingChunkAcks.delete(key); reject(error); },
+        resolve: () => { this.pendingChunkAcks.delete(key); resolve(); },
+        reject: (error) => { this.pendingChunkAcks.delete(key); reject(error); },
       });
     });
   }
 
   private waitForFileVerification(fileId: string, checksum: string): Promise<void> {
     return new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pendingVerifications.delete(fileId);
-        reject(new Error('Timed out waiting for browser file verification.'));
-      }, 30_000);
+      /** No elapsed-time deadline: peer closure and FILE_ERROR are terminal. */
       this.pendingVerifications.set(fileId, {
         checksum,
-        resolve: () => { clearTimeout(timer); this.pendingVerifications.delete(fileId); resolve(); },
-        reject: (error) => { clearTimeout(timer); this.pendingVerifications.delete(fileId); reject(error); },
+        resolve: () => { this.pendingVerifications.delete(fileId); resolve(); },
+        reject: (error) => { this.pendingVerifications.delete(fileId); reject(error); },
       });
     });
   }
@@ -414,7 +426,7 @@ class BridgeSession {
       this.remoteReady.add(remoteId);
       const waiters = this.remoteReadyWaiters.get(remoteId) || [];
       this.remoteReadyWaiters.delete(remoteId);
-      waiters.forEach((resolve) => resolve());
+      waiters.forEach(({ resolve }) => resolve());
       channel.send(JSON.stringify({ type: 'DIRECT_READY_ACK' }));
       return;
     }
@@ -458,7 +470,14 @@ class BridgeSession {
     this.pendingCandidates.delete(remoteId);
     this.directReady.delete(remoteId);
     this.remoteReady.delete(remoteId);
+    const waiters = this.remoteReadyWaiters.get(remoteId) || [];
     this.remoteReadyWaiters.delete(remoteId);
+    const error = new Error('The direct WebRTC peer closed before readiness was confirmed.');
+    waiters.forEach(({ reject }) => reject(error));
+    for (const waiter of this.pendingChunkAcks.values()) waiter.reject(error);
+    for (const waiter of this.pendingVerifications.values()) waiter.reject(error);
+    this.pendingChunkAcks.clear();
+    this.pendingVerifications.clear();
     try { peer?.close(); } catch {}
   }
   leave(): void { if (this.roomCode && this.socket.connected) this.socket.emit('leave-room', { roomCode: this.roomCode }); for (const id of this.peers.keys()) this.closePeer(id); this.roomCode = ''; this.currentDevice = null; this.devices = []; }

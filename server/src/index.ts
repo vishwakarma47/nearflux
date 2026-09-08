@@ -5,7 +5,6 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { Server } from 'socket.io';
 import { deviceManager } from './services/deviceManager.js';
-import { createTelegramBridge } from './telegram/telegramBridge.js';
 import { setupSocketHandlers } from './socket/socketHandler.js';
 import { ClientToServerEvents, ServerToClientEvents } from './types/index.js';
 
@@ -44,7 +43,13 @@ const io = new Server<ClientToServerEvents, ServerToClientEvents>(server, {
 });
 
 setupSocketHandlers(io);
-createTelegramBridge(app, PORT);
+if (process.env.TELEGRAM_BRIDGE_MODE === 'remote') {
+  console.log('[telegram] remote bridge mode enabled; Telegram Bot/WebRTC runs on the standalone bridge host.');
+} else {
+  void import('./telegram/telegramBridge.js')
+    .then(({ createTelegramBridge }) => createTelegramBridge(app, PORT))
+    .catch((error: unknown) => console.warn(`[telegram] legacy bridge failed to load: ${error instanceof Error ? error.message : String(error)}`));
+}
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`NearFlux signaling server listening on port ${PORT}`);

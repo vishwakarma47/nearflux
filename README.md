@@ -48,7 +48,7 @@ Direct connectivity is not guaranteed on every firewall or NAT combination. That
 
 ## Telegram integration
 
-The optional Telegram Bot and Mini App integration is documented in [`TELEGRAM_SETUP.md`](./TELEGRAM_SETUP.md). It joins the existing ephemeral room and signaling system as a server-side WebRTC bridge; the original browser-to-browser path remains available and unchanged when Telegram is disabled.
+The Telegram Bot and Mini App integration is documented in [`TELEGRAM_SETUP.md`](./TELEGRAM_SETUP.md). The future-host split architecture is documented in [`TELEGRAM_BRIDGE_DEPLOYMENT.md`](./TELEGRAM_BRIDGE_DEPLOYMENT.md), and its independently deployable service is in [`bridge/`](./bridge/). The original browser-to-browser path remains available and unchanged; Render stays responsible for rooms, presence, signaling, and the web application.
 
 ## License
 

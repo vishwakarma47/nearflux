@@ -13,6 +13,17 @@ import {
 export function setupSocketHandlers(
   io: Server<ClientToServerEvents, ServerToClientEvents>
 ): void {
+  io.use((socket, next) => {
+    const configuredSecret = process.env.BRIDGE_SHARED_SECRET?.trim();
+    const providedSecret = typeof socket.handshake.auth?.bridgeSecret === 'string'
+      ? socket.handshake.auth.bridgeSecret.trim()
+      : '';
+    if (providedSecret && (!configuredSecret || providedSecret !== configuredSecret)) {
+      return next(new Error('Invalid bridge credentials.'));
+    }
+    next();
+  });
+
   io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>) => {
     socket.on('keepalive', () => {});
 

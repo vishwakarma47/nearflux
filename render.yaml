@@ -13,6 +13,10 @@ services:
         sync: false
       - key: RENDER_EXTERNAL_URL
         value: https://nearflux-p2p-share.onrender.com
+      - key: TELEGRAM_BRIDGE_MODE
+        value: remote
+      - key: BRIDGE_SHARED_SECRET
+        sync: false
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: TELEGRAM_WEBAPP_URL
